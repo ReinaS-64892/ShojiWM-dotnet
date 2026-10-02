@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/dotnet/">
+    <Project Path="dotnet/ShojiWM.Example/ShojiWM.Example.csproj" />
+    <Project Path="dotnet/ShojiWM.Runtime/ShojiWM.Runtime.csproj" />
+    <Project Path="dotnet/ShojiWM.Tests/ShojiWM.Tests.csproj" />
+    <Project Path="dotnet/ShojiWM/ShojiWM.csproj" />
+  </Folder>
+</Solution>
