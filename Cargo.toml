@@ -4,5 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
 shojiwm_lib = { path = "./ShojiWM/src/shojiwm_lib" }
+netcorehost = { version = "=0.22.0", default-features = false, features = ["net8_0"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tracing = "0.1.41"
+# Smithay's pinned revision uses beta.2 APIs; later betas are incompatible.
+winit = { version = "=0.31.0-beta.2", default-features = false }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[lib]
+name = "shojiwm_dotnet"

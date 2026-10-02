@@ -1,4 +1,3 @@
-fn main() {
-    // DO IT !
-    // shojiwm_lib::run()
+fn main() -> std::process::ExitCode {
+    shojiwm_lib::run(shojiwm_dotnet::DotNetLauncher)
 }

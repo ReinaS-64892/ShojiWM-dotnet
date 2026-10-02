@@ -1,6 +1,10 @@
-./old-integrated
-
-
 # Added by cargo
-
 /target
+
+/old-integrated
+
+/dotnet/**/bin/
+/dotnet/**/obj/
+/dotnet/**/target/
+/dotnet/ShojiWM/Generated/
+/tools/__pycache__/
