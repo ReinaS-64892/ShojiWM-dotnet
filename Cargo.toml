@@ -1,0 +1,8 @@
+[package]
+name = "ShojiWM-dotnet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+shojiwm_lib = { path = "./ShojiWM/src/shojiwm_lib" }
