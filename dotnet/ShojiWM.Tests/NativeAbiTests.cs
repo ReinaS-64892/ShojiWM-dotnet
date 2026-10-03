@@ -1,132 +1,72 @@
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using ShojiWM.Runtime;
+using ShojiWM.Wire;
 
 internal static unsafe class NativeAbiTests
 {
     private static void Check(bool value) { if (!value) throw new InvalidOperationException("native ABI assertion"); }
-
-    public static void Strings()
+    private static string Consume(SwmEvaluateResult result, int status)
     {
-        delegate* unmanaged<DotnetString, void> free = &NativeEntryPoint.FreeDotnetString;
-        int size = IntPtr.Size == 8 ? 16 : 8;
-        Check(sizeof(RustString) == size && sizeof(DotnetString) == size);
-        Check(sizeof(NativeStatus) == 4 && sizeof(NativeResult) == (IntPtr.Size == 8 ? 24 : 12));
-        Check(Marshal.OffsetOf<NativeResult>(nameof(NativeResult.Status)) == 0);
-        Check(Marshal.OffsetOf<NativeResult>(nameof(NativeResult.Response)) == IntPtr.Size);
-        Check(Marshal.OffsetOf<RustString>(nameof(RustString.Ptr)) == 0);
-        Check(Marshal.OffsetOf<DotnetString>(nameof(DotnetString.Ptr)) == 0);
-        Check(Marshal.OffsetOf<RustString>(nameof(RustString.Length)) == IntPtr.Size);
-        Check(Marshal.OffsetOf<DotnetString>(nameof(DotnetString.Length)) == IntPtr.Size);
-        foreach (string text in new[] { "", "ASCII", "日本語・é・🙂\0末尾" })
-        {
-            var bytes = Encoding.UTF8.GetBytes(text);
-            string copied;
-            fixed (byte* ptr = bytes) copied = new RustString(ptr, bytes.Length).ToManagedString();
-            Array.Fill(bytes, (byte)'x'); // The managed copy outlives its borrowed input.
-            Check(copied == text);
-            var owned = DotnetString.CopyFrom(text);
-            var other = DotnetString.CopyFromUtf8(Encoding.UTF8.GetBytes(text));
-            try
-            {
-                Check(owned.Length == Encoding.UTF8.GetByteCount(text));
-                Check(new RustString(owned.Ptr, owned.Length).ToManagedString() == text);
-                Check(new RustString(other.Ptr, other.Length).ToManagedString() == text);
-                Check(text.Length == 0 || owned.Ptr != other.Ptr);
-            }
-            finally { free(owned); free(other); }
-        }
-        Check(new RustString(null, 0).ToManagedString() == "");
-        foreach (int length in new[] { -1, 1, NativeEntryPoint.MaxMessageBytes + 1 })
-            Reject(() => new RustString(null, length).ToManagedString());
-        foreach (byte[] invalid in new byte[][] { [0xff], [0xc0, 0xaf], [0xed, 0xa0, 0x80], [0xf0, 0x9f] })
-        {
-            fixed (byte* ptr = invalid)
-            {
-                bool rejected = false;
-                try { new RustString(ptr, invalid.Length).ToManagedString(); }
-                catch (ArgumentException) { rejected = true; }
-                Check(rejected);
-            }
-            Reject(() => DotnetString.CopyFromUtf8(invalid));
-        }
-        bool oversized = false;
-        try { DotnetString.CopyFrom(new string('x', NativeEntryPoint.MaxMessageBytes + 1)); }
-        catch (InvalidDataException) { oversized = true; }
-        Check(oversized);
-        free(default);
+        delegate* unmanaged<ResultArena, void> free = &NativeEntryPoint.SWMArenaFree;
+        try { Check(result.Status == status); return result.Error == null ? "" : AbiConvert.ReadString(*result.Error); }
+        finally { free(result.Arena); }
     }
-
-    private static void Reject(Action action)
+    private static string Consume(SwmStatusResult result, int status)
     {
-        try { action(); }
-        catch (ArgumentException) { return; }
-        throw new InvalidOperationException("invalid string accepted");
+        delegate* unmanaged<ResultArena, void> free = &NativeEntryPoint.SWMArenaFree;
+        try { Check(result.Status == status); return result.Error == null ? "" : AbiConvert.ReadString(*result.Error); }
+        finally { free(result.Arena); }
     }
-
-    private static string ReadAndFree(NativeResult result)
-    {
-        delegate* unmanaged<DotnetString, void> free = &NativeEntryPoint.FreeDotnetString;
-        try { return new RustString(result.Response.Ptr, result.Response.Length).ToManagedString(); }
-        finally { free(result.Response); }
-    }
-
-    private static string AssertResult(NativeResult result, NativeStatus status)
-    {
-        string response = ReadAndFree(result);
-        Check(result.Status == status);
-        return response;
-    }
-
-    public static void Run(string config, string request)
+    public static void Run(string config, EvaluateRequest request)
     {
         delegate* unmanaged<uint> version = &NativeEntryPoint.GetAbiVersion;
-        delegate* unmanaged<RustString, NativeResult> initialize = &NativeEntryPoint.Initialize;
-        delegate* unmanaged<RustString, NativeResult> invoke = &NativeEntryPoint.Invoke;
-        delegate* unmanaged<NativeResult> shutdown = &NativeEntryPoint.Shutdown;
-        Check(version() == NativeEntryPoint.AbiVersion);
-        AssertResult(invoke(default), NativeStatus.Failure);
-        AssertResult(shutdown(), NativeStatus.Success);
+        delegate* unmanaged<ArenaString, SwmStatusResult> initialize = &NativeEntryPoint.SWMInitialize;
+        delegate* unmanaged<SwmEvaluateInput, SwmEvaluateResult> evaluate = &NativeEntryPoint.SWMEvaluate;
+        delegate* unmanaged<SwmStatusResult> shutdown = &NativeEntryPoint.SWMShutdown;
+        Check(version() == 6);
+        var hostError = Consume(evaluate(default), 2);
+        Check(hostError.Contains("System.InvalidOperationException") && hostError.Contains("NativeEntryPoint.CurrentHost"));
+        Consume(shutdown(), 0);
         var path = Encoding.UTF8.GetBytes(config);
-        fixed (byte* input = path)
-        {
-            AssertResult(initialize(new(input, NativeEntryPoint.MaxMessageBytes + 1)), NativeStatus.Failure);
-            AssertResult(initialize(new(input, -1)), NativeStatus.Failure);
-            AssertResult(initialize(new(null, 1)), NativeStatus.Failure);
-            AssertResult(initialize(new(input, path.Length)), NativeStatus.Success);
+        fixed (byte* p = path) {
+            Consume(initialize(new() { Ptr = null, Length = 1 }), 2);
+            Consume(initialize(new() { Ptr = p, Length = -1 }), 2);
+            Consume(initialize(new() { Ptr = p, Length = path.Length }), 0);
         }
-        try
-        {
-            fixed (byte* input = path)
-                Check(AssertResult(initialize(new(input, path.Length)), NativeStatus.Failure).Contains("already initialized"));
-            // Rejected calls from another thread must leave the original host usable.
-            Task.Run(() =>
-            {
-                delegate* unmanaged<RustString, NativeResult> call = &NativeEntryPoint.Invoke;
-                delegate* unmanaged<NativeResult> stop = &NativeEntryPoint.Shutdown;
-                Check(AssertResult(call(default), NativeStatus.Failure).Contains("different thread"));
-                Check(AssertResult(stop(), NativeStatus.Failure).Contains("different thread"));
+        try {
+            fixed (byte* p = path) Check(Consume(initialize(new() { Ptr = p, Length = path.Length }), 2).Contains("already initialized"));
+            Task.Run(() => {
+                delegate* unmanaged<SwmEvaluateInput, SwmEvaluateResult> call = &NativeEntryPoint.SWMEvaluate;
+                delegate* unmanaged<SwmStatusResult> stop = &NativeEntryPoint.SWMShutdown;
+                Check(Consume(call(default), 2).Contains("different thread"));
+                Check(Consume(stop(), 2).Contains("different thread"));
             }).GetAwaiter().GetResult();
-            var json = Encoding.UTF8.GetBytes(request);
-            fixed (byte* input = json)
-            {
-                string copied = AssertResult(invoke(new(input, json.Length)), NativeStatus.Success);
-                using var document = JsonDocument.Parse(copied); // Foreign response already freed.
-                Check(document.RootElement.GetProperty("requestId").GetUInt64() == 42);
-                Check(document.RootElement.GetProperty("ok").GetBoolean());
-                AssertResult(invoke(new(input, NativeEntryPoint.MaxMessageBytes + 1)), NativeStatus.Failure);
-                AssertResult(invoke(new(input, -1)), NativeStatus.Failure);
+            // Test-only legacy JSON transport oracle; production has no JSON entry point.
+            using var oracle = new ConfigurationHost(config);
+            var baseline = JsonSerializer.Deserialize<EvaluationResult>(JsonSerializer.Serialize(oracle.Evaluate(request), WireJson.Options), WireJson.Options)!;
+            ArenaTests.Differential(request, baseline);
+            Check(Consume(evaluate(default), 4).Contains("System.ArgumentException"));
+            // Every exception uses ToString(), including exceptions formerly given
+            // a special allocation status. No exception type changes its category.
+            try { throw new OutOfMemoryException("test diagnostic"); }
+            catch (Exception error) {
+                string diagnostic = Consume(AbiConvert.FailureEvaluate(error, NativeFailureStatus.SemanticError), 1);
+                Check(diagnostic.Contains("System.OutOfMemoryException") && diagnostic.Contains("NativeAbiTests.Run"));
             }
-            var invalid = new byte[] { 0xff };
-            fixed (byte* input = invalid) AssertResult(invoke(new(input, 1)), NativeStatus.Failure);
-            AssertResult(invoke(new(null, 1)), NativeStatus.Failure);
-        }
-        finally { AssertResult(shutdown(), NativeStatus.Success); }
-        AssertResult(invoke(default), NativeStatus.Failure);
-        AssertResult(shutdown(), NativeStatus.Success);
-        // Sequential compositor/test lifetimes can initialize after a clean shutdown.
-        fixed (byte* input = path) AssertResult(initialize(new(input, path.Length)), NativeStatus.Success);
-        AssertResult(shutdown(), NativeStatus.Success);
+            using var measure = new ArenaWriter(); ArenaTests.WriteInput(request, measure);
+            using var writer = new ArenaWriter(measure.Length);
+            var input = ArenaTests.WriteInput(request, writer);
+            ArenaWriter.FailAllocationForTest = true;
+            try {
+                Consume(evaluate(default), 4); // Diagnostic allocation failure retains input category.
+                Consume(evaluate(input), 1); // Result allocation failure retains runtime category.
+            }
+            finally { ArenaWriter.FailAllocationForTest = false; }
+            ArenaTests.Differential(request, baseline);
+        } finally { Consume(shutdown(), 0); }
+        Consume(evaluate(default), 2); Consume(shutdown(), 0);
+        fixed (byte* p = path) Consume(initialize(new() { Ptr = p, Length = path.Length }), 0);
+        Consume(shutdown(), 0);
     }
 }

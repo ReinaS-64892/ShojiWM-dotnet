@@ -5,5 +5,10 @@
     <GenerateDependencyFile>true</GenerateDependencyFile>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Explicit paths also work when generation happens after project evaluation. -->
+    <Compile Remove="Ffi/Generated/*.g.cs" />
+    <Compile Include="Ffi/Generated/NativeAbi.g.cs;Ffi/Generated/NativeLayouts.g.cs;Ffi/Generated/OperationAbi.g.cs;Ffi/Generated/NativeEntryPoint.g.cs" />
+  </ItemGroup>
   <ItemGroup><ProjectReference Include="../ShojiWM/ShojiWM.csproj" /></ItemGroup>
 </Project>

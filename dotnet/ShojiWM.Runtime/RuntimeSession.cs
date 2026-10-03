@@ -1,10 +1,9 @@
-using System.Text.Json;
 using ShojiWM.Wire;
 
 namespace ShojiWM.Runtime;
 
-/// Semantic requests are independent of native hosting. Config callbacks stay
-/// managed; only handler IDs are returned to Rust.
+/// Owns managed callbacks and cached snapshots. Each operation enters its own
+/// method; neither semantic nor transport operation dispatch happens here.
 public sealed class RuntimeSession : IDisposable
 {
     private IWindowConfig? config;
@@ -16,97 +15,88 @@ public sealed class RuntimeSession : IDisposable
     private readonly string generationId = Guid.NewGuid().ToString("N");
     private bool enabled;
 
-    public ExternalRuntimeResponse HandleJson(string json)
-    {
-        ulong requestId = 0;
-        var kind = "protocolError";
-        try
-        {
-            if (config is null) throw new ObjectDisposedException(nameof(RuntimeSession));
-            using var document = JsonDocument.Parse(json);
-            var root = document.RootElement;
-            if (root.TryGetProperty("requestId", out var id) && id.TryGetUInt64(out var value)) requestId = value;
-            if (root.TryGetProperty("kind", out var k) && k.ValueKind == JsonValueKind.String) kind = k.GetString()!;
-            var request = JsonSerializer.Deserialize<ExternalRuntimeRequest>(json, WireJson.Options) ?? throw new JsonException("missing request");
-            return Handle(request);
-        }
-        catch (Exception error)
-        {
-            return new() { RequestId = requestId, Kind = kind, Ok = false, Error = error.Message };
-        }
-    }
+    private IWindowConfig RequireConfig() => config ?? throw new ObjectDisposedException(nameof(RuntimeSession));
 
-    public ExternalRuntimeResponse Handle(ExternalRuntimeRequest request)
+    public EvaluationResult Evaluate(EvaluateRequest request)
     {
         actions.Clear();
-        try
-        {
-            if (config is null) throw new ObjectDisposedException(nameof(RuntimeSession));
-            WireDecorationNode? serialized = null;
-            bool? invoked = null;
-            RuntimeDebugConfigUpdate? debugConfig = null;
-            switch (request.Kind)
-            {
-                case "drainPreload":
-                    break; // Assembly was already loaded, so startup errors precede this ACK.
-                case "lifecycleEnable":
-                    if (!enabled) { enabled = true; config.OnEnable(request.Reason ?? "initial"); }
-                    debugConfig = config.DebugConfig;
-                    break;
-                case "lifecycleDisable":
-                    Disable(request.Reason ?? "shutdown");
-                    break;
-                case "evaluate":
-                case "evaluatePreview":
-                case "evaluateCandidatePreview":
-                case "evaluateCached":
-                    var snapshot = request.Snapshot ??
-                        (request.WindowId is string cachedId && windows.TryGetValue(cachedId, out var cached) ? cached.Snapshot : null)
-                        ?? throw new JsonException("evaluate requires a snapshot or a known windowId");
-                    if (string.IsNullOrEmpty(snapshot.Id) || request.WindowId is string requestedId && requestedId != snapshot.Id)
-                        throw new JsonException("snapshot id must match windowId");
-                    serialized = Render(snapshot, request, request.Kind is "evaluatePreview" or "evaluateCandidatePreview");
-                    break;
-                case "invokeHandler":
-                    var windowId = request.WindowId ?? throw new JsonException("invokeHandler requires windowId");
-                    var handlerId = request.HandlerId ?? throw new JsonException("invokeHandler requires handlerId");
-                    invoked = false;
-                    if (windows.TryGetValue(windowId, out var entry))
-                    {
-                        var handler = entry.Handlers.Values.FirstOrDefault(handler => handler.Id == handlerId);
-                        if (handler.Callback is not null)
-                        {
-                            handler.Callback();
-                            invoked = true;
-                            serialized = Render(entry.Snapshot, request, false);
-                        }
-                    }
-                    break;
-                case "windowClosed":
-                    var closedId = request.WindowId ?? throw new JsonException("windowClosed requires windowId");
-                    if (windows.Remove(closedId)) config.OnWindowClosed(closedId);
-                    break;
-                default:
-                    throw new JsonException($"unsupported runtime message kind: {request.Kind}");
-            }
-            return new() { RequestId = request.RequestId, Kind = request.Kind, Ok = true, Serialized = serialized, Invoked = invoked, Actions = [.. actions], DebugConfig = debugConfig };
-        }
-        catch (Exception error)
-        {
-            actions.Clear();
-            return new() { RequestId = request.RequestId, Kind = request.Kind, Ok = false, Error = error.Message };
-        }
+        try { return new(Render(ValidateSnapshot(request.Snapshot, request.WindowId), request.Context, false), [.. actions]); }
+        finally { actions.Clear(); }
     }
-
-    private WireDecorationNode Render(WaylandWindowSnapshot snapshot, ExternalRuntimeRequest request, bool preview)
+    public EvaluationResult EvaluatePreview(EvaluatePreviewRequest request)
     {
-        var context = new RenderContext(request.NowMs, preview, request.DisplayState, request.InputState);
+        actions.Clear();
+        try { return new(Render(ValidateSnapshot(request.Snapshot, request.WindowId), request.Context, true), [.. actions]); }
+        finally { actions.Clear(); }
+    }
+    public EvaluationResult EvaluateCandidatePreview(EvaluateCandidatePreviewRequest request)
+    {
+        actions.Clear();
+        try { return new(Render(ValidateSnapshot(request.Snapshot, request.WindowId), request.Context, true), [.. actions]); }
+        finally { actions.Clear(); }
+    }
+    public EvaluationResult EvaluateCached(EvaluateCachedRequest request)
+    {
+        actions.Clear();
+        try {
+            var snapshot = request.Snapshot ??
+                (windows.TryGetValue(request.WindowId, out var cached) ? cached.Snapshot : null)
+                ?? throw new InvalidOperationException("evaluate requires a snapshot or a known windowId");
+            return new(Render(ValidateSnapshot(snapshot, request.WindowId), request.Context, false), [.. actions]);
+        } finally { actions.Clear(); }
+    }
+    public HandlerInvocationResult InvokeHandler(InvokeHandlerRequest request)
+    {
+        actions.Clear();
+        try {
+            RequireConfig();
+            if (windows.TryGetValue(request.WindowId, out var entry)) {
+                var handler = entry.Handlers.Values.FirstOrDefault(handler => handler.Id == request.HandlerId);
+                if (handler.Callback is not null) {
+                    handler.Callback();
+                    return new(true, Render(entry.Snapshot, request.Context, false), [.. actions]);
+                }
+            }
+            return new(false, null, []);
+        } finally { actions.Clear(); }
+    }
+    public void WindowClosed(WindowClosedRequest request)
+    {
+        actions.Clear();
+        try { var current = RequireConfig(); if (windows.Remove(request.WindowId)) current.OnWindowClosed(request.WindowId); }
+        finally { actions.Clear(); }
+    }
+    public LifecycleEnableResult LifecycleEnable(LifecycleEnableRequest request)
+    {
+        actions.Clear();
+        try {
+            var current = RequireConfig();
+            if (!enabled) { enabled = true; current.OnEnable(request.Reason); }
+            return new([.. actions], current.DebugConfig);
+        } finally { actions.Clear(); }
+    }
+    public void LifecycleDisable(LifecycleDisableRequest request)
+    {
+        RequireConfig();
+        Disable(request.Reason);
+    }
+    public void DrainPreload() { RequireConfig(); actions.Clear(); }
+
+    private static WaylandWindowSnapshot ValidateSnapshot(WaylandWindowSnapshot snapshot, string? windowId)
+    {
+        if (string.IsNullOrEmpty(snapshot.Id) || windowId is not null && windowId != snapshot.Id)
+            throw new InvalidOperationException("snapshot id must match windowId");
+        return snapshot;
+    }
+    private WireDecorationNode Render(WaylandWindowSnapshot snapshot, EvaluationContext request, bool preview)
+    {
+        var current = RequireConfig();
+        var context = new RenderContext(request.NowMs, preview, request.Displays, request.Inputs);
         var window = new WaylandWindow(snapshot, action => { if (!preview) actions.Add(action); });
-        var composition = config!.RenderWindow(window, context) ?? throw new InvalidOperationException("config returned no composition");
+        var composition = current.RenderWindow(window, context) ?? throw new InvalidOperationException("config returned no composition");
         var handlers = new Dictionary<string, (string Id, Action Callback)>();
         windows.TryGetValue(snapshot.Id, out var previous);
-        var tree = composition.ToWire((key, callback) =>
-        {
+        var tree = composition.ToWire((key, callback) => {
             var id = previous is not null && previous.Handlers.TryGetValue(key, out var prior)
                 ? prior.Id : $"handler-{generationId}-{checked(++nextHandlerId)}";
             handlers.Add(key, (id, callback));
@@ -115,23 +105,18 @@ public sealed class RuntimeSession : IDisposable
         if (!preview) windows[snapshot.Id] = new(snapshot, handlers);
         return tree;
     }
-
     private void Disable(string reason)
     {
         try { if (enabled) config?.OnDisable(reason); }
         finally { enabled = false; windows.Clear(); actions.Clear(); }
     }
-
     public void Dispose()
     {
         var previous = config;
         try { Disable("shutdown"); }
-        finally
-        {
-            // Remove all host-held config/delegate references before ALC.Unload.
+        finally {
             config = null;
-            if (previous is IAsyncDisposable asyncDisposable)
-                asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            if (previous is IAsyncDisposable asyncDisposable) asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
             else if (previous is IDisposable disposable) disposable.Dispose();
         }
     }

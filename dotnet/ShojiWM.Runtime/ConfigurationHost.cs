@@ -1,5 +1,4 @@
 using System.Runtime.CompilerServices;
-using System.Text.Json;
 using ShojiWM.Wire;
 
 namespace ShojiWM.Runtime;
@@ -17,90 +16,70 @@ public sealed class ConfigurationHost : IDisposable
 
     public ConfigurationHost(string configPath) => current = ConfigurationGeneration.Load(configPath, retired);
 
-    public ExternalRuntimeResponse HandleJson(string json)
-    {
-        ulong id = 0;
-        var kind = "protocolError";
-        try
-        {
-            using var document = JsonDocument.Parse(json);
-            if (document.RootElement.TryGetProperty("requestId", out var value)) value.TryGetUInt64(out id);
-            if (document.RootElement.TryGetProperty("kind", out value) && value.ValueKind == JsonValueKind.String) kind = value.GetString()!;
-            var request = JsonSerializer.Deserialize<ExternalRuntimeRequest>(json, WireJson.Options) ?? throw new JsonException("missing request");
-            return Handle(request);
-        }
-        catch (Exception error) { return Failure(id, kind, error.Message); }
-    }
-
-    public ExternalRuntimeResponse Handle(ExternalRuntimeRequest request)
-    {
-        if (request.Kind == "prepareAssembly" && retired.Count != 0)
-        {
-            VerifyUnloads();
-            if (retired.Count != 0)
-                return Failure(request.RequestId, request.Kind, "unload: previous ALC still referenced; refusing to accumulate generations");
-        }
-        var response = HandleCore(request);
-        if (request.Kind is "prepareAssembly" or "commitAssembly" or "abortAssembly" or "shutdownAssemblies") VerifyUnloads();
-        return response;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private ExternalRuntimeResponse HandleCore(ExternalRuntimeRequest request)
-    {
-        try
-        {
-            if (current is null) throw new ObjectDisposedException(nameof(ConfigurationHost));
-            switch (request.Kind)
-            {
-                case "prepareAssembly":
-                    Prepare(request);
-                    return Ack(request);
-                case "evaluateCandidatePreview":
-                    return CandidateSession.Handle(request);
-                case "commitAssembly":
-                    var debugConfig = candidateDebugConfig;
-                    Commit();
-                    return new() { RequestId = request.RequestId, Kind = request.Kind, Ok = true, Actions = [], DebugConfig = debugConfig };
-                case "abortAssembly":
-                    Abort();
-                    return Ack(request);
-                case "shutdownAssemblies":
-                    ReleaseAll();
-                    return Ack(request);
-                default:
-                    return current.Session.Handle(request);
-            }
-        }
-        catch (Exception error)
-        {
-            var message = error.Message;
-            // A failed prepare owns no active resources. Collection happens
-            // only at lifecycle boundaries, after load/enable stack unwinds.
-            return Failure(request.RequestId, request.Kind, message);
-        }
-    }
-
+    private RuntimeSession CurrentSession => current?.Session ?? throw new ObjectDisposedException(nameof(ConfigurationHost));
     private RuntimeSession CandidateSession => candidate?.Session ?? throw new ConfigurationException("reload", "no prepared assembly");
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private void Prepare(ExternalRuntimeRequest request)
+    public EvaluationResult Evaluate(EvaluateRequest request) => CurrentSession.Evaluate(request);
+    public EvaluationResult EvaluatePreview(EvaluatePreviewRequest request) => CurrentSession.EvaluatePreview(request);
+    public EvaluationResult EvaluateCached(EvaluateCachedRequest request) => CurrentSession.EvaluateCached(request);
+    public EvaluationResult EvaluateCandidatePreview(EvaluateCandidatePreviewRequest request)
     {
-        ReleaseCandidate();
-        var path = request.ConfigPath ?? throw new ConfigurationException("assemblyLoad", "prepareAssembly requires configPath");
-        candidate = ConfigurationGeneration.Load(path, retired);
-        var enabled = candidate.Session.Handle(new()
-        {
-            Kind = "lifecycleEnable", RequestId = request.RequestId, Reason = "reload",
-            NowMs = request.NowMs, DisplayState = request.DisplayState, InputState = request.InputState,
-        });
-        if (!enabled.Ok || enabled.Actions.Count != 0)
-        {
-            var error = enabled.Error ?? "OnEnable returned unsupported window actions";
-            ReleaseCandidate();
-            throw new ConfigurationException("initialization", error);
+        _ = CurrentSession;
+        return CandidateSession.EvaluateCandidatePreview(request);
+    }
+    public HandlerInvocationResult InvokeHandler(InvokeHandlerRequest request) => CurrentSession.InvokeHandler(request);
+    public void WindowClosed(WindowClosedRequest request) => CurrentSession.WindowClosed(request);
+    public LifecycleEnableResult LifecycleEnable(LifecycleEnableRequest request) => CurrentSession.LifecycleEnable(request);
+    public void LifecycleDisable(LifecycleDisableRequest request) => CurrentSession.LifecycleDisable(request);
+    public void DrainPreload() => CurrentSession.DrainPreload();
+
+    public void PrepareAssembly(PrepareAssemblyRequest request)
+    {
+        _ = CurrentSession;
+        if (retired.Count != 0) {
+            VerifyUnloads();
+            if (retired.Count != 0) throw new ConfigurationException("unload", "previous ALC still referenced; refusing to accumulate generations");
         }
-        candidateDebugConfig = enabled.DebugConfig;
+        // Flatten config exceptions in a separate frame before collecting ALCs.
+        var error = PrepareAssemblyCore(request);
+        VerifyUnloads();
+        if (error is not null) throw new ConfigurationException("initialization", error);
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private string? PrepareAssemblyCore(PrepareAssemblyRequest request)
+    {
+        try {
+            ReleaseCandidate();
+            candidate = ConfigurationGeneration.Load(request.ConfigPath, retired);
+            var enabled = candidate.Session.LifecycleEnable(new("reload"));
+            if (enabled.Actions.Count != 0) throw new ConfigurationException("initialization", "OnEnable returned unsupported window actions");
+            candidateDebugConfig = enabled.DebugConfig;
+            return null;
+        } catch (Exception error) {
+            var message = error.ToString();
+            ReleaseCandidate();
+            return message;
+        }
+    }
+    public AssemblyCommitResult CommitAssembly()
+    {
+        _ = CurrentSession;
+        var debug = candidateDebugConfig;
+        SwitchGeneration();
+        VerifyUnloads();
+        return new(debug);
+    }
+    public void AbortAssembly()
+    {
+        _ = CurrentSession;
+        ReleaseCandidate();
+        VerifyUnloads();
+    }
+    public void ShutdownAssemblies()
+    {
+        _ = CurrentSession;
+        ReleaseAll();
+        VerifyUnloads();
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -114,11 +93,6 @@ public sealed class ConfigurationHost : IDisposable
         if (previous is not null) retired.Add(previous.Release("reload"));
     }
 
-    private void Commit()
-    {
-        SwitchGeneration();
-    }
-
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void ReleaseCandidate()
     {
@@ -126,11 +100,6 @@ public sealed class ConfigurationHost : IDisposable
         var previous = candidate;
         candidate = null;
         if (previous is not null) retired.Add(previous.Release("reload-rejected"));
-    }
-
-    private void Abort()
-    {
-        ReleaseCandidate();
     }
 
     public void VerifyUnloads()
@@ -163,8 +132,4 @@ public sealed class ConfigurationHost : IDisposable
         VerifyUnloads();
     }
 
-    private static ExternalRuntimeResponse Ack(ExternalRuntimeRequest request) => new()
-    { RequestId = request.RequestId, Kind = request.Kind, Ok = true, Actions = [] };
-    private static ExternalRuntimeResponse Failure(ulong id, string kind, string error) => new()
-    { RequestId = id, Kind = kind, Ok = false, Error = error, Actions = [] };
 }

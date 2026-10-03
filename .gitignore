@@ -6,7 +6,8 @@
 /dotnet/**/bin/
 /dotnet/**/obj/
 /dotnet/**/target/
-/dotnet/ShojiWM/Generated/
+/dotnet/**/Generated/
+/src/bridge/native_generated.rs
 /tools/fixtures/
 /tools/bin/
 /tools/obj/

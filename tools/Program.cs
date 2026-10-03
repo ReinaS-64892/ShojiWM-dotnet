@@ -26,12 +26,14 @@ internal static class Program
         {
             Description = "Check generated bindings without modifying them.",
         };
-        var generate = new Command("generate", "Generate C# bindings from the Rust DTOs.") { check };
+        var generate = new Command("generate", "Generate bindings and native FFI boilerplate.") { check };
         generate.SetAction(result =>
         {
             string root = FindRoot();
             if (result.GetValue(check)) BindingGenerator.Check(root);
             else BindingGenerator.Write(root);
+            NativeAbiGenerator.Run(root, result.GetValue(check));
+            NativeOperationGenerator.Run(root, result.GetValue(check));
         });
 
         var test = new Command("test", "Run binding generator regression tests.");
@@ -50,7 +52,7 @@ internal static class Program
     private static string FindRoot()
     {
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
-            if (File.Exists(Path.Combine(directory.FullName, "src/bridge/protocol.rs")) &&
+            if (File.Exists(Path.Combine(directory.FullName, "tools/NativeAbi.schema.json")) &&
                 File.Exists(Path.Combine(directory.FullName, "Cargo.toml")))
                 return directory.FullName;
         throw new InvalidOperationException("Cannot find the repository root from the tool location.");

@@ -1,5 +1,8 @@
-//! In-process CoreCLR hosting. Only bootstrap function pointers cross this
-//! boundary. Config objects stay managed; all calls for a host run on one thread.
+//! Permanent CoreCLR bootstrap; every foreign call and arena stays on one thread.
+use super::{
+    arena::{ArenaString, MAX_ARENA_SIZE, ResultArena},
+    native::*,
+};
 use netcorehost::{hostfxr::Hostfxr, pdcstr, pdcstring::PdCString};
 use std::{
     marker::PhantomData,
@@ -8,101 +11,30 @@ use std::{
     sync::{OnceLock, mpsc},
     thread::{self, JoinHandle},
 };
-
-pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
-const ABI_VERSION: u32 = 3;
-
-/// Immutable UTF-8 borrowed for one synchronous call. Only pass this view while
-/// its source slice is live; managed code must copy before retaining the text.
-#[repr(C)]
-struct RustString {
-    ptr: *const u8,
-    length: i32,
-}
-impl RustString {
-    fn new(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_MESSAGE_BYTES {
-            return Err("request exceeds 8 MiB message limit".into());
-        }
-        Ok(Self {
-            ptr: bytes.as_ptr(),
-            length: bytes.len() as i32,
-        })
-    }
-}
-
-/// Immutable UTF-8 whose ownership is transferred from .NET to Rust. Only the
-/// permanent bootstrap's FreeDotnetString may release it, exactly once.
-/// This raw ABI value is deliberately not Clone/Copy; use OwnedDotnetString.
-#[repr(C)]
-struct DotnetString {
-    ptr: *const u8,
-    length: i32,
-}
-impl DotnetString {
-    fn empty() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            length: 0,
-        }
-    }
-}
-
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeStatus {
-    Success = 0,
-    Failure = 1,
-    AllocationFailure = 2,
-}
-
-/// Status plus an owned response, returned by value. Keep the status as raw i32
-/// at the foreign boundary so an unknown discriminant is an error, never Rust UB.
-#[repr(C)]
-struct NativeResult {
-    status: i32,
-    response: DotnetString,
-}
-impl NativeResult {
-    fn into_bytes(self, api: &Bootstrap, operation: &str) -> Result<Vec<u8>, String> {
-        let response = OwnedDotnetString {
-            value: self.response,
-            api,
-        }
-        .into_bytes()?;
-        match self.status {
-            status if status == NativeStatus::Success as i32 => Ok(response),
-            status => {
-                let status = match status {
-                    status if status == NativeStatus::Failure as i32 => "failure".to_owned(),
-                    status if status == NativeStatus::AllocationFailure as i32 => {
-                        "allocation failure".to_owned()
-                    }
-                    status => format!("unknown status {status}"),
-                };
-                Err(format!(
-                    "managed {operation} ({status}): {}",
-                    String::from_utf8_lossy(&response)
-                ))
-            }
-        }
-    }
-}
-
-type Initialize = extern "system" fn(RustString) -> NativeResult;
-type Invoke = extern "system" fn(RustString) -> NativeResult;
-type Shutdown = extern "system" fn() -> NativeResult;
-type Free = extern "system" fn(DotnetString);
-
+const ABI_VERSION: u32 = 6;
+type Initialize = extern "system" fn(ArenaString) -> SwmStatusResult;
+type Shutdown = extern "system" fn() -> SwmStatusResult;
 #[derive(Clone, Copy)]
-struct Bootstrap {
+struct DotNetExports {
     initialize: Initialize,
-    invoke: Invoke,
     shutdown: Shutdown,
-    free: Free,
+    arena_free: ArenaFree,
+    evaluate: extern "system" fn(SwmEvaluateInput) -> SwmEvaluateResult,
+    evaluate_preview: extern "system" fn(SwmEvaluatePreviewInput) -> SwmEvaluateResult,
+    evaluate_candidate_preview:
+        extern "system" fn(SwmEvaluateCandidatePreviewInput) -> SwmEvaluateResult,
+    evaluate_cached: extern "system" fn(SwmEvaluateCachedInput) -> SwmEvaluateResult,
+    invoke_handler: extern "system" fn(SwmInvokeHandlerInput) -> SwmInvokeHandlerResult,
+    window_closed: extern "system" fn(ArenaString) -> SwmStatusResult,
+    prepare_assembly: extern "system" fn(ArenaString) -> SwmStatusResult,
+    lifecycle_enable: extern "system" fn(ArenaString) -> SwmLifecycleEnableResult,
+    lifecycle_disable: extern "system" fn(ArenaString) -> SwmStatusResult,
+    commit_assembly: extern "system" fn() -> SwmCommitAssemblyResult,
+    abort_assembly: extern "system" fn() -> SwmStatusResult,
+    drain_preload: extern "system" fn() -> SwmStatusResult,
+    shutdown_assemblies: extern "system" fn() -> SwmStatusResult,
 }
-static BOOTSTRAP: OnceLock<Result<(PathBuf, Bootstrap), String>> = OnceLock::new();
-
+static BOOTSTRAP: OnceLock<Result<(PathBuf, DotNetExports), String>> = OnceLock::new();
 fn component_path(path: &Path) -> Result<PathBuf, String> {
     // Accept the previous apphost spelling by resolving its sibling DLL.
     let dll = if path.extension().is_some_and(|x| x == "dll") {
@@ -175,7 +107,10 @@ fn find_hostfxr() -> Result<PathBuf, String> {
     )
 }
 
-fn bootstrap(path: &Path) -> Result<Bootstrap, String> {
+fn bootstrap(path: &Path) -> Result<DotNetExports, String> {
+    if std::mem::size_of::<usize>() != 8 {
+        return Err("native ABI v6 requires 64-bit pointers".into());
+    }
     let path = component_path(path)?;
     let loaded = BOOTSTRAP.get_or_init(|| {
         let runtimeconfig = path.with_extension("runtimeconfig.json");
@@ -207,40 +142,23 @@ fn bootstrap(path: &Path) -> Result<Bootstrap, String> {
                 "ABI version mismatch: expected {ABI_VERSION}, got {version}"
             ));
         }
-        // Signatures exactly match the permanent bootstrap's blittable ABI.
-        let initialize = *loader
-            .get_function_with_unmanaged_callers_only::<fn(RustString) -> NativeResult>(
-                name,
-                pdcstr!("Initialize"),
-            )
-            .map_err(|e| e.to_string())?;
-        let invoke = *loader
-            .get_function_with_unmanaged_callers_only::<fn(RustString) -> NativeResult>(
-                name,
-                pdcstr!("Invoke"),
-            )
-            .map_err(|e| e.to_string())?;
-        let shutdown = *loader
-            .get_function_with_unmanaged_callers_only::<fn() -> NativeResult>(
-                name,
-                pdcstr!("Shutdown"),
-            )
-            .map_err(|e| e.to_string())?;
-        let free = *loader
-            .get_function_with_unmanaged_callers_only::<fn(DotnetString)>(
-                name,
-                pdcstr!("FreeDotnetString"),
-            )
-            .map_err(|e| e.to_string())?;
-        Ok((
-            path.clone(),
-            Bootstrap {
-                initialize,
-                invoke,
-                shutdown,
-                free,
-            },
-        ))
+        let initialize = *loader.get_function_with_unmanaged_callers_only::<fn(ArenaString) -> SwmStatusResult>(name, pdcstr!("SWMInitialize")).map_err(|e| e.to_string())?;
+        let shutdown = *loader.get_function_with_unmanaged_callers_only::<fn() -> SwmStatusResult>(name, pdcstr!("SWMShutdown")).map_err(|e| e.to_string())?;
+        let arena_free = *loader.get_function_with_unmanaged_callers_only::<fn(ResultArena)>(name, pdcstr!("SWMArenaFree")).map_err(|e| e.to_string())?;
+        let evaluate = *loader.get_function_with_unmanaged_callers_only::<fn(SwmEvaluateInput) -> SwmEvaluateResult>(name, pdcstr!("SWMEvaluate")).map_err(|e| e.to_string())?;
+        let evaluate_preview = *loader.get_function_with_unmanaged_callers_only::<fn(SwmEvaluatePreviewInput) -> SwmEvaluateResult>(name, pdcstr!("SWMEvaluatePreview")).map_err(|e| e.to_string())?;
+        let evaluate_candidate_preview = *loader.get_function_with_unmanaged_callers_only::<fn(SwmEvaluateCandidatePreviewInput) -> SwmEvaluateResult>(name, pdcstr!("SWMEvaluateCandidatePreview")).map_err(|e| e.to_string())?;
+        let evaluate_cached = *loader.get_function_with_unmanaged_callers_only::<fn(SwmEvaluateCachedInput) -> SwmEvaluateResult>(name, pdcstr!("SWMEvaluateCached")).map_err(|e| e.to_string())?;
+        let invoke_handler = *loader.get_function_with_unmanaged_callers_only::<fn(SwmInvokeHandlerInput) -> SwmInvokeHandlerResult>(name, pdcstr!("SWMInvokeHandler")).map_err(|e| e.to_string())?;
+        let window_closed = *loader.get_function_with_unmanaged_callers_only::<fn(ArenaString) -> SwmStatusResult>(name, pdcstr!("SWMWindowClosed")).map_err(|e| e.to_string())?;
+        let prepare_assembly = *loader.get_function_with_unmanaged_callers_only::<fn(ArenaString) -> SwmStatusResult>(name, pdcstr!("SWMPrepareAssembly")).map_err(|e| e.to_string())?;
+        let lifecycle_enable = *loader.get_function_with_unmanaged_callers_only::<fn(ArenaString) -> SwmLifecycleEnableResult>(name, pdcstr!("SWMLifecycleEnable")).map_err(|e| e.to_string())?;
+        let lifecycle_disable = *loader.get_function_with_unmanaged_callers_only::<fn(ArenaString) -> SwmStatusResult>(name, pdcstr!("SWMLifecycleDisable")).map_err(|e| e.to_string())?;
+        let commit_assembly = *loader.get_function_with_unmanaged_callers_only::<fn() -> SwmCommitAssemblyResult>(name, pdcstr!("SWMCommitAssembly")).map_err(|e| e.to_string())?;
+        let abort_assembly = *loader.get_function_with_unmanaged_callers_only::<fn() -> SwmStatusResult>(name, pdcstr!("SWMAbortAssembly")).map_err(|e| e.to_string())?;
+        let drain_preload = *loader.get_function_with_unmanaged_callers_only::<fn() -> SwmStatusResult>(name, pdcstr!("SWMDrainPreload")).map_err(|e| e.to_string())?;
+        let shutdown_assemblies = *loader.get_function_with_unmanaged_callers_only::<fn() -> SwmStatusResult>(name, pdcstr!("SWMShutdownAssemblies")).map_err(|e| e.to_string())?;
+        Ok((path.clone(), DotNetExports { initialize, shutdown, arena_free, evaluate, evaluate_preview, evaluate_candidate_preview, evaluate_cached, invoke_handler, window_closed, prepare_assembly, lifecycle_enable, lifecycle_disable, commit_assembly, abort_assembly, drain_preload, shutdown_assemblies }))
     });
     match loaded {
         Ok((active, api)) if active == &path => Ok(*api),
@@ -249,139 +167,231 @@ fn bootstrap(path: &Path) -> Result<Bootstrap, String> {
     }
 }
 
-struct OwnedDotnetString<'a> {
-    value: DotnetString,
-    api: &'a Bootstrap,
-}
-impl<'a> OwnedDotnetString<'a> {
-    #[cfg(test)]
-    fn new(api: &'a Bootstrap) -> Self {
-        Self {
-            value: DotnetString::empty(),
-            api,
-        }
-    }
-
-    // Consume the owner: the foreign allocation is freed immediately after the
-    // copy, including all validation/UTF-8 failure paths. Only Rust-owned bytes escape.
-    fn into_bytes(self) -> Result<Vec<u8>, String> {
-        if self.value.length < 0
-            || self.value.length as usize > MAX_MESSAGE_BYTES
-            || (self.value.ptr.is_null() && self.value.length != 0)
-        {
-            return Err("invalid native response buffer or message exceeds 8 MiB limit".into());
-        }
-        if self.value.length == 0 {
-            return Ok(Vec::new());
-        }
-        // SAFETY: bootstrap owns a readable allocation of length bytes until
-        // FreeDotnetString. We copy before the RAII guard releases it.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(self.value.ptr, self.value.length as usize) };
-        std::str::from_utf8(bytes).map_err(|e| format!("invalid DotnetString UTF-8: {e}"))?;
-        Ok(bytes.to_vec())
-    }
-}
-impl Drop for OwnedDotnetString<'_> {
-    fn drop(&mut self) {
-        (self.api.free)(std::mem::replace(&mut self.value, DotnetString::empty()));
-    }
-}
-
 struct ManagedHost {
-    api: Bootstrap,
-    // A unique lifetime token, confined to the initializing thread. It is neither
-    // Clone nor Send/Sync; dropping it shuts down the single static managed host.
+    api: DotNetExports,
     owner_thread: PhantomData<Rc<()>>,
 }
 impl ManagedHost {
-    fn initialize(api: Bootstrap, path: &Path) -> Result<Self, String> {
+    fn initialize(api: DotNetExports, path: &Path) -> Result<Self, String> {
         let bytes = path.to_str().ok_or("config path must be UTF-8")?.as_bytes();
-        if bytes.len() > MAX_MESSAGE_BYTES {
+        if bytes.len() > MAX_ARENA_SIZE {
             return Err("config path too long".into());
         }
-        let result = (api.initialize)(RustString::new(bytes)?);
-        // Own successful initialization before validating its response, so an
-        // early error drops the token and releases the static managed host.
-        let host = (result.status == NativeStatus::Success as i32).then(|| Self {
+        let result = (api.initialize)(ArenaString {
+            ptr: bytes.as_ptr(),
+            length: bytes.len() as i32,
+        });
+        let host = (result.status == 0).then(|| Self {
             api,
             owner_thread: PhantomData,
         });
-        result.into_bytes(&api, "initialization")?;
+        result.decode(api.arena_free).map_err(|e| e.to_string())?;
         host.ok_or_else(|| "managed initialization did not establish ownership".into())
     }
-    fn exchange(&self, bytes: &[u8]) -> Result<Vec<u8>, String> {
-        if bytes.len() > MAX_MESSAGE_BYTES {
-            return Err("request exceeds 8 MiB message limit".into());
+    fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluationResponse, BridgeError> {
+        let (_input_owner, input) = request.borrowed()?;
+        (self.api.evaluate)(input).decode(self.api.arena_free)
+    }
+    fn evaluate_preview(
+        &self,
+        request: EvaluatePreviewRequest,
+    ) -> Result<EvaluationResponse, BridgeError> {
+        let (_input_owner, input) = request.borrowed()?;
+        (self.api.evaluate_preview)(input).decode(self.api.arena_free)
+    }
+    fn evaluate_candidate_preview(
+        &self,
+        request: EvaluateCandidatePreviewRequest,
+    ) -> Result<EvaluationResponse, BridgeError> {
+        let (_input_owner, input) = request.borrowed()?;
+        (self.api.evaluate_candidate_preview)(input).decode(self.api.arena_free)
+    }
+    fn evaluate_cached(
+        &self,
+        request: EvaluateCachedRequest,
+    ) -> Result<EvaluationResponse, BridgeError> {
+        let (_input_owner, input) = request.borrowed()?;
+        (self.api.evaluate_cached)(input).decode(self.api.arena_free)
+    }
+    fn invoke_handler(
+        &self,
+        request: InvokeHandlerRequest,
+    ) -> Result<HandlerResponse, BridgeError> {
+        let (_input_owner, input) = request.borrowed()?;
+        (self.api.invoke_handler)(input).decode(self.api.arena_free)
+    }
+    fn window_closed(&self, request: String) -> Result<(), BridgeError> {
+        if request.len() > MAX_ARENA_SIZE {
+            return Err(BridgeError::Host("input string exceeds 8 MiB limit".into()));
         }
-        (self.api.invoke)(RustString::new(bytes)?).into_bytes(&self.api, "invocation")
+        let input = ArenaString {
+            ptr: request.as_ptr(),
+            length: request.len() as i32,
+        };
+        (self.api.window_closed)(input).decode(self.api.arena_free)
+    }
+    fn prepare_assembly(&self, request: String) -> Result<(), BridgeError> {
+        if request.len() > MAX_ARENA_SIZE {
+            return Err(BridgeError::Host("input string exceeds 8 MiB limit".into()));
+        }
+        let input = ArenaString {
+            ptr: request.as_ptr(),
+            length: request.len() as i32,
+        };
+        (self.api.prepare_assembly)(input).decode(self.api.arena_free)
+    }
+    fn lifecycle_enable(&self, request: String) -> Result<EnableResponse, BridgeError> {
+        if request.len() > MAX_ARENA_SIZE {
+            return Err(BridgeError::Host("input string exceeds 8 MiB limit".into()));
+        }
+        let input = ArenaString {
+            ptr: request.as_ptr(),
+            length: request.len() as i32,
+        };
+        (self.api.lifecycle_enable)(input).decode(self.api.arena_free)
+    }
+    fn lifecycle_disable(&self, request: String) -> Result<(), BridgeError> {
+        if request.len() > MAX_ARENA_SIZE {
+            return Err(BridgeError::Host("input string exceeds 8 MiB limit".into()));
+        }
+        let input = ArenaString {
+            ptr: request.as_ptr(),
+            length: request.len() as i32,
+        };
+        (self.api.lifecycle_disable)(input).decode(self.api.arena_free)
+    }
+    fn commit_assembly(&self) -> Result<CommitResponse, BridgeError> {
+        (self.api.commit_assembly)().decode(self.api.arena_free)
+    }
+    fn abort_assembly(&self) -> Result<(), BridgeError> {
+        (self.api.abort_assembly)().decode(self.api.arena_free)
+    }
+    fn drain_preload(&self) -> Result<(), BridgeError> {
+        (self.api.drain_preload)().decode(self.api.arena_free)
+    }
+    fn shutdown_assemblies(&self) -> Result<(), BridgeError> {
+        (self.api.shutdown_assemblies)().decode(self.api.arena_free)
     }
 }
 impl Drop for ManagedHost {
     fn drop(&mut self) {
-        if let Err(error) = (self.api.shutdown)().into_bytes(&self.api, "shutdown") {
-            eprintln!("ShojiWM .NET {error}");
+        if let Err(error) = (self.api.shutdown)().decode(self.api.arena_free) {
+            eprintln!("ShojiWM .NET shutdown: {error}");
         }
     }
 }
-
-enum Command {
-    Invoke(Vec<u8>, mpsc::SyncSender<Result<Vec<u8>, String>>),
-}
+// Jobs carry only Rust-owned inputs/results. Their function identity is preserved;
+// there is no operation tag or enum dispatcher on the managed thread.
+type RuntimeJob = Box<dyn FnOnce(&ManagedHost) + Send>;
 #[derive(Debug)]
 pub struct InProcessDotNetHost {
-    commands: Option<mpsc::Sender<Command>>,
+    commands: Option<mpsc::Sender<RuntimeJob>>,
     thread: Option<JoinHandle<()>>,
 }
 impl InProcessDotNetHost {
     pub fn start(component: &Path, config: &Path) -> Result<Self, String> {
         let component = component.to_owned();
         let config = config.to_owned();
-        let (commands, receiver) = mpsc::channel();
+        let (commands, receiver) = mpsc::channel::<RuntimeJob>();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("dotnet-runtime".into())
             .spawn(move || {
-                let result =
-                    bootstrap(&component).and_then(|api| ManagedHost::initialize(api, &config));
-                let host = match result {
+                let host = match bootstrap(&component)
+                    .and_then(|api| ManagedHost::initialize(api, &config))
+                {
                     Ok(host) => host,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
                         return;
                     }
                 };
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
-                while let Ok(Command::Invoke(bytes, reply)) = receiver.recv() {
-                    let _ = reply.send(host.exchange(&bytes));
+                while let Ok(job) = receiver.recv() {
+                    job(&host);
                 }
-                // Host destruction on its original thread, then thread joins. No
-                // timeout, abandoned execution, CLR restart or child process.
             })
             .map_err(|e| e.to_string())?;
-        let ready = ready_rx.recv().map_err(|e| e.to_string()).and_then(|r| r);
-        if let Err(error) = ready {
+        if let Err(e) = ready_rx.recv().map_err(|e| e.to_string()).and_then(|r| r) {
             let _ = thread.join();
-            return Err(error);
+            return Err(e);
         }
         Ok(Self {
             commands: Some(commands),
             thread: Some(thread),
         })
     }
-    pub fn exchange(&mut self, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-        if bytes.len() > MAX_MESSAGE_BYTES {
-            return Err("request exceeds 8 MiB message limit".into());
-        }
+    fn on_runtime_thread<T: Send + 'static>(
+        &mut self,
+        job: impl FnOnce(&ManagedHost) -> Result<T, BridgeError> + Send + 'static,
+    ) -> Result<T, BridgeError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.commands
             .as_ref()
-            .ok_or("runtime host unavailable; ShojiWM restart required")?
-            .send(Command::Invoke(bytes, tx))
-            .map_err(|e| e.to_string())?;
-        rx.recv().map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                BridgeError::Host("runtime host unavailable; ShojiWM restart required".into())
+            })?
+            .send(Box::new(move |host| {
+                let _ = tx.send(job(host));
+            }))
+            .map_err(|e| BridgeError::Host(e.to_string()))?;
+        rx.recv().map_err(|e| BridgeError::Host(e.to_string()))?
+    }
+    pub fn evaluate(
+        &mut self,
+        request: EvaluateRequest,
+    ) -> Result<EvaluationResponse, BridgeError> {
+        self.on_runtime_thread(move |host| host.evaluate(request))
+    }
+    pub fn evaluate_preview(
+        &mut self,
+        request: EvaluatePreviewRequest,
+    ) -> Result<EvaluationResponse, BridgeError> {
+        self.on_runtime_thread(move |host| host.evaluate_preview(request))
+    }
+    pub fn evaluate_candidate_preview(
+        &mut self,
+        request: EvaluateCandidatePreviewRequest,
+    ) -> Result<EvaluationResponse, BridgeError> {
+        self.on_runtime_thread(move |host| host.evaluate_candidate_preview(request))
+    }
+    pub fn evaluate_cached(
+        &mut self,
+        request: EvaluateCachedRequest,
+    ) -> Result<EvaluationResponse, BridgeError> {
+        self.on_runtime_thread(move |host| host.evaluate_cached(request))
+    }
+    pub fn invoke_handler(
+        &mut self,
+        request: InvokeHandlerRequest,
+    ) -> Result<HandlerResponse, BridgeError> {
+        self.on_runtime_thread(move |host| host.invoke_handler(request))
+    }
+    pub fn window_closed(&mut self, request: String) -> Result<(), BridgeError> {
+        self.on_runtime_thread(move |host| host.window_closed(request))
+    }
+    pub fn prepare_assembly(&mut self, request: String) -> Result<(), BridgeError> {
+        self.on_runtime_thread(move |host| host.prepare_assembly(request))
+    }
+    pub fn lifecycle_enable(&mut self, request: String) -> Result<EnableResponse, BridgeError> {
+        self.on_runtime_thread(move |host| host.lifecycle_enable(request))
+    }
+    pub fn lifecycle_disable(&mut self, request: String) -> Result<(), BridgeError> {
+        self.on_runtime_thread(move |host| host.lifecycle_disable(request))
+    }
+    pub fn commit_assembly(&mut self) -> Result<CommitResponse, BridgeError> {
+        self.on_runtime_thread(move |host| host.commit_assembly())
+    }
+    pub fn abort_assembly(&mut self) -> Result<(), BridgeError> {
+        self.on_runtime_thread(move |host| host.abort_assembly())
+    }
+    pub fn drain_preload(&mut self) -> Result<(), BridgeError> {
+        self.on_runtime_thread(move |host| host.drain_preload())
+    }
+    pub fn shutdown_assemblies(&mut self) -> Result<(), BridgeError> {
+        self.on_runtime_thread(move |host| host.shutdown_assemblies())
     }
     pub fn stop(&mut self) {
         self.commands.take();
@@ -393,147 +403,5 @@ impl InProcessDotNetHost {
 impl Drop for InProcessDotNetHost {
     fn drop(&mut self) {
         self.stop();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn string_abi_layout_and_borrowed_bytes() {
-        let size = if std::mem::size_of::<usize>() == 8 {
-            16
-        } else {
-            8
-        };
-        assert_eq!(std::mem::size_of::<RustString>(), size);
-        assert_eq!(std::mem::size_of::<DotnetString>(), size);
-        assert_eq!(std::mem::size_of::<NativeStatus>(), 4);
-        assert_eq!(
-            std::mem::size_of::<NativeResult>(),
-            if size == 16 { 24 } else { 12 }
-        );
-        assert_eq!(std::mem::offset_of!(NativeResult, status), 0);
-        assert_eq!(
-            std::mem::offset_of!(NativeResult, response),
-            std::mem::size_of::<usize>()
-        );
-        assert_eq!(std::mem::offset_of!(RustString, ptr), 0);
-        assert_eq!(std::mem::offset_of!(DotnetString, ptr), 0);
-        assert_eq!(
-            std::mem::offset_of!(RustString, length),
-            std::mem::size_of::<usize>()
-        );
-        assert_eq!(
-            std::mem::offset_of!(DotnetString, length),
-            std::mem::size_of::<usize>()
-        );
-        let text = "日本語🙂\0末尾";
-        let borrowed = RustString::new(text.as_bytes()).unwrap();
-        assert_eq!(borrowed.ptr, text.as_ptr());
-        assert_eq!(borrowed.length as usize, text.len());
-        assert_eq!(RustString::new(&[]).unwrap().length, 0);
-        assert!(RustString::new(&vec![0; MAX_MESSAGE_BYTES + 1]).is_err());
-    }
-
-    #[test]
-    fn owned_dotnet_string_frees_once_on_copy_validation_error_and_drop() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static FREED: AtomicUsize = AtomicUsize::new(0);
-        extern "system" fn free(value: DotnetString) {
-            FREED.fetch_add(1, Ordering::SeqCst);
-            if !value.ptr.is_null() {
-                // Test allocations are one Box<u8>, independently of the ABI length.
-                unsafe {
-                    drop(Box::from_raw(value.ptr as *mut u8));
-                }
-            }
-        }
-        extern "system" fn initialize(_: RustString) -> NativeResult {
-            NativeResult {
-                status: NativeStatus::Success as i32,
-                response: DotnetString::empty(),
-            }
-        }
-        extern "system" fn invoke(_: RustString) -> NativeResult {
-            initialize(RustString::new(&[]).unwrap())
-        }
-        extern "system" fn shutdown() -> NativeResult {
-            initialize(RustString::new(&[]).unwrap())
-        }
-        let api = Bootstrap {
-            initialize,
-            invoke,
-            shutdown,
-            free,
-        };
-        let cases = [
-            (Some(b'x'), 1, true),
-            (None, 0, true),
-            (Some(b'x'), 0, true),
-            (None, 1, false),
-            (Some(b'x'), -1, false),
-            (Some(b'x'), MAX_MESSAGE_BYTES as i32 + 1, false),
-            (Some(0xff), 1, false),
-        ];
-        for (index, (byte, length, success)) in cases.into_iter().enumerate() {
-            let mut owned = OwnedDotnetString::new(&api);
-            owned.value = DotnetString {
-                ptr: byte.map_or(std::ptr::null(), |byte| Box::into_raw(Box::new(byte))),
-                length,
-            };
-            let copied = owned.into_bytes();
-            assert_eq!(FREED.load(Ordering::SeqCst), index + 1);
-            assert_eq!(copied.is_ok(), success);
-            if length == 1 && success {
-                assert_eq!(copied.unwrap(), b"x");
-            }
-        }
-        drop(OwnedDotnetString::new(&api));
-        assert_eq!(FREED.load(Ordering::SeqCst), cases.len() + 1);
-        for (offset, status) in [
-            NativeStatus::Failure as i32,
-            NativeStatus::AllocationFailure as i32,
-            999,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let result = NativeResult {
-                status,
-                response: DotnetString {
-                    ptr: Box::into_raw(Box::new(b'x')),
-                    length: 1,
-                },
-            };
-            assert!(result.into_bytes(&api, "test").is_err());
-            assert_eq!(FREED.load(Ordering::SeqCst), cases.len() + 2 + offset);
-        }
-    }
-
-    #[test]
-    fn old_dotted_apphost_name_resolves_bootstrap_not_public_api() {
-        let root = std::env::temp_dir().join(format!(
-            "shoji-bootstrap-path-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let bootstrap = root.join("ShojiWM.Runtime.dll");
-        std::fs::write(&bootstrap, []).unwrap();
-        std::fs::write(root.join("ShojiWM.dll"), []).unwrap();
-        assert_eq!(
-            component_path(&root.join("ShojiWM.Runtime")).unwrap(),
-            bootstrap.canonicalize().unwrap()
-        );
-        assert_eq!(
-            component_path(&bootstrap).unwrap(),
-            bootstrap.canonicalize().unwrap()
-        );
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

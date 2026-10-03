@@ -9,7 +9,6 @@ internal static class BindingGenerator
 {
     internal static readonly string[] Sources =
     [
-        "src/bridge/protocol.rs",
         "ShojiWM/src/shojiwm_lib/src/ssd/bridge.rs",
         "ShojiWM/src/shojiwm_lib/src/ssd/window_model.rs",
         "ShojiWM/src/shojiwm_lib/src/ssd/interaction.rs",
@@ -21,7 +20,7 @@ internal static class BindingGenerator
     internal const string Output = "dotnet/ShojiWM/Generated/Protocol.g.cs";
     private static readonly UTF8Encoding Utf8 = new(false, true);
     private static readonly string[] RootTypes =
-        ["ExternalRuntimeRequest", "ExternalRuntimeResponse", "WireRuntimeHandler", "WireWindowAction"];
+        ["WaylandWindowSnapshot", "WaylandOutputSnapshot", "RuntimeInputDeviceSnapshot", "WireDecorationNode", "RuntimeWindowAction", "RuntimeDebugConfigUpdate", "WireRuntimeHandler", "WireWindowAction"];
     private static readonly Dictionary<string, string> Custom = new(StringComparer.Ordinal)
     {
         ["WireDecorationChild"] = "WireDecorationNode", // MVP: node children only

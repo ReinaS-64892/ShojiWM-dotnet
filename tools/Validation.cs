@@ -9,9 +9,13 @@ internal static class Validation
         UpstreamClean(root);
         try
         {
-            RunProcess(root, "rustfmt", ["--check", "--edition", "2024", "src/lib.rs", "src/main.rs", "tests/runtime.rs"]);
             BindingGenerator.Write(root);
+            NativeAbiGenerator.Run(root, false);
+            NativeOperationGenerator.Run(root, false);
+            RunProcess(root, "rustfmt", ["--check", "--edition", "2024", "src/lib.rs", "src/main.rs", "tests/runtime.rs"]);
             BindingGenerator.Check(root);
+            NativeAbiGenerator.Run(root, true);
+            NativeOperationGenerator.Run(root, true);
             GeneratorTests.Run(root);
             RunProcess(root, "cargo", ["build", "--locked", "--offline"]);
             RunProcess(root, "cargo", ["test", "--locked", "--offline"]);
@@ -27,7 +31,7 @@ internal static class Validation
                 ["SHOJI_TEST_DOTNET_FIXTURE"] = fixture,
             };
             RunProcess(root, "cargo", ["test", "--locked", "--offline", "--", "--ignored", "--test-threads=1"], environment);
-            RunProcess(root, "cargo", ["run", "--locked", "--offline", "--manifest-path", "dotnet/NativeHost.Tests/Cargo.toml", "--", runtime, fixture]);
+            RunProcess(root, "cargo", ["run", "--locked", "--offline", "--manifest-path", "dotnet/NativeHost.Tests/Cargo.toml", "--target-dir", "target", "--", runtime, fixture]);
             string executable = Path.Combine(root, "target/debug/ShojiWM-dotnet" + (OperatingSystem.IsWindows() ? ".exe" : ""));
             RunProcess(root, executable, ["--help"]);
             RunProcess(root, executable, ["--version"]);

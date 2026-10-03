@@ -1,0 +1,973 @@
+{
+  "models": [
+    {
+      "name": "DecorationInteractionSnapshot",
+      "semantic": "shojiwm_lib::ssd::DecorationInteractionSnapshot",
+      "fields": [
+        {
+          "name": "HoveredIds",
+          "rust": "hovered_ids",
+          "type": "List<string>"
+        },
+        {
+          "name": "ActiveIds",
+          "rust": "active_ids",
+          "type": "List<string>"
+        }
+      ]
+    },
+    {
+      "name": "OutputModeSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::OutputModeSnapshot",
+      "fields": [
+        {
+          "name": "Width",
+          "rust": "width",
+          "type": "int"
+        },
+        {
+          "name": "Height",
+          "rust": "height",
+          "type": "int"
+        },
+        {
+          "name": "RefreshRate",
+          "rust": "refresh_rate",
+          "type": "double"
+        }
+      ]
+    },
+    {
+      "name": "OutputPositionSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::OutputPositionSnapshot",
+      "fields": [
+        {
+          "name": "X",
+          "rust": "x",
+          "type": "int"
+        },
+        {
+          "name": "Y",
+          "rust": "y",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "RuntimeDebugConfigUpdate",
+      "semantic": "shojiwm_lib::runtime_debug::RuntimeDebugConfigUpdate",
+      "fields": [
+        {
+          "name": "FpsCounter",
+          "rust": "fps_counter",
+          "type": "bool"
+        },
+        {
+          "name": "Profile",
+          "rust": "profile",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "RuntimeInputDeviceKindSnapshot",
+      "semantic": "shojiwm_lib::runtime_input::RuntimeInputDeviceKindSnapshot",
+      "fields": [
+        {
+          "name": "Keyboard",
+          "rust": "keyboard",
+          "type": "bool"
+        },
+        {
+          "name": "Pointer",
+          "rust": "pointer",
+          "type": "bool"
+        },
+        {
+          "name": "Touchpad",
+          "rust": "touchpad",
+          "type": "bool"
+        },
+        {
+          "name": "Touch",
+          "rust": "touch",
+          "type": "bool"
+        },
+        {
+          "name": "TabletTool",
+          "rust": "tablet_tool",
+          "type": "bool"
+        },
+        {
+          "name": "TabletPad",
+          "rust": "tablet_pad",
+          "type": "bool"
+        },
+        {
+          "name": "Gesture",
+          "rust": "gesture",
+          "type": "bool"
+        },
+        {
+          "name": "SwitchDevice",
+          "rust": "switch_device",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "RuntimeInputDeviceSnapshot",
+      "semantic": "shojiwm_lib::runtime_input::RuntimeInputDeviceSnapshot",
+      "fields": [
+        {
+          "name": "Name",
+          "rust": "name",
+          "type": "string"
+        },
+        {
+          "name": "Sysname",
+          "rust": "sysname",
+          "type": "string?"
+        },
+        {
+          "name": "Vendor",
+          "rust": "vendor",
+          "type": "uint?"
+        },
+        {
+          "name": "Product",
+          "rust": "product",
+          "type": "uint?"
+        },
+        {
+          "name": "Kind",
+          "rust": "kind",
+          "type": "RuntimeInputDeviceKindSnapshot"
+        }
+      ]
+    },
+    {
+      "name": "RuntimeWindowAction",
+      "semantic": "shojiwm_lib::ssd::RuntimeWindowAction",
+      "fields": [
+        {
+          "name": "WindowId",
+          "rust": "window_id",
+          "type": "string"
+        },
+        {
+          "name": "Action",
+          "rust": "action",
+          "type": "WaylandWindowAction"
+        },
+        {
+          "name": "Animation",
+          "rust": "animation",
+          "type": "JsonElement?"
+        },
+        {
+          "name": "Channel",
+          "rust": "channel",
+          "type": "string?"
+        }
+      ]
+    },
+    {
+      "name": "WaylandOutputSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WaylandOutputSnapshot",
+      "fields": [
+        {
+          "name": "Name",
+          "rust": "name",
+          "type": "string"
+        },
+        {
+          "name": "Description",
+          "rust": "description",
+          "type": "string?"
+        },
+        {
+          "name": "Make",
+          "rust": "make",
+          "type": "string?"
+        },
+        {
+          "name": "Model",
+          "rust": "model",
+          "type": "string?"
+        },
+        {
+          "name": "Serial",
+          "rust": "serial",
+          "type": "string?"
+        },
+        {
+          "name": "Connector",
+          "rust": "connector",
+          "type": "string?"
+        },
+        {
+          "name": "Enabled",
+          "rust": "enabled",
+          "type": "bool"
+        },
+        {
+          "name": "Resolution",
+          "rust": "resolution",
+          "type": "OutputModeSnapshot?"
+        },
+        {
+          "name": "Position",
+          "rust": "position",
+          "type": "OutputPositionSnapshot"
+        },
+        {
+          "name": "Scale",
+          "rust": "scale",
+          "type": "double"
+        },
+        {
+          "name": "Transform",
+          "rust": "transform",
+          "type": "OutputTransformSnapshot"
+        },
+        {
+          "name": "AvailableModes",
+          "rust": "available_modes",
+          "type": "List<OutputModeSnapshot>"
+        },
+        {
+          "name": "Subpixel",
+          "rust": "subpixel",
+          "type": "OutputSubpixelSnapshot"
+        },
+        {
+          "name": "DetectedSubpixel",
+          "rust": "detected_subpixel",
+          "type": "OutputSubpixelSnapshot"
+        }
+      ]
+    },
+    {
+      "name": "WaylandWindowSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WaylandWindowSnapshot",
+      "fields": [
+        {
+          "name": "Id",
+          "rust": "id",
+          "type": "string"
+        },
+        {
+          "name": "Title",
+          "rust": "title",
+          "type": "string"
+        },
+        {
+          "name": "AppId",
+          "rust": "app_id",
+          "type": "string?"
+        },
+        {
+          "name": "Position",
+          "rust": "position",
+          "type": "WindowPositionSnapshot"
+        },
+        {
+          "name": "Rect",
+          "rust": "rect",
+          "type": "WindowPositionSnapshot"
+        },
+        {
+          "name": "IsFocused",
+          "rust": "is_focused",
+          "type": "bool"
+        },
+        {
+          "name": "IsFloating",
+          "rust": "is_floating",
+          "type": "bool"
+        },
+        {
+          "name": "IsMaximized",
+          "rust": "is_maximized",
+          "type": "bool"
+        },
+        {
+          "name": "IsFullscreen",
+          "rust": "is_fullscreen",
+          "type": "bool"
+        },
+        {
+          "name": "IsXwayland",
+          "rust": "is_xwayland",
+          "type": "bool"
+        },
+        {
+          "name": "Decoration",
+          "rust": "decoration",
+          "type": "WindowDecorationStateSnapshot"
+        },
+        {
+          "name": "SizeConstraints",
+          "rust": "size_constraints",
+          "type": "WindowSizeConstraintsSnapshot"
+        },
+        {
+          "name": "IsResizable",
+          "rust": "is_resizable",
+          "type": "bool"
+        },
+        {
+          "name": "IsTransient",
+          "rust": "is_transient",
+          "type": "bool"
+        },
+        {
+          "name": "ParentId",
+          "rust": "parent_id",
+          "type": "string?"
+        },
+        {
+          "name": "Icon",
+          "rust": "icon",
+          "type": "WindowIconSnapshot?"
+        },
+        {
+          "name": "Interaction",
+          "rust": "interaction",
+          "type": "DecorationInteractionSnapshot"
+        }
+      ]
+    },
+    {
+      "name": "WindowDecorationStateSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WindowDecorationStateSnapshot",
+      "fields": [
+        {
+          "name": "Protocol",
+          "rust": "protocol",
+          "type": "WindowDecorationProtocolSnapshot"
+        },
+        {
+          "name": "ClientPreference",
+          "rust": "client_preference",
+          "type": "WindowDecorationModeSnapshot?"
+        },
+        {
+          "name": "ConfiguredMode",
+          "rust": "configured_mode",
+          "type": "WindowDecorationModeSnapshot"
+        },
+        {
+          "name": "Mode",
+          "rust": "mode",
+          "type": "WindowDecorationModeSnapshot"
+        }
+      ]
+    },
+    {
+      "name": "WindowIconSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WindowIconSnapshot",
+      "fields": [
+        {
+          "name": "Name",
+          "rust": "name",
+          "type": "string?"
+        },
+        {
+          "name": "Bytes",
+          "rust": "bytes",
+          "type": "List<byte>?"
+        }
+      ]
+    },
+    {
+      "name": "WindowPositionSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WindowPositionSnapshot",
+      "fields": [
+        {
+          "name": "X",
+          "rust": "x",
+          "type": "double"
+        },
+        {
+          "name": "Y",
+          "rust": "y",
+          "type": "double"
+        },
+        {
+          "name": "Width",
+          "rust": "width",
+          "type": "double"
+        },
+        {
+          "name": "Height",
+          "rust": "height",
+          "type": "double"
+        }
+      ]
+    },
+    {
+      "name": "WindowSizeConstraintsSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WindowSizeConstraintsSnapshot",
+      "fields": [
+        {
+          "name": "Min",
+          "rust": "min",
+          "type": "WindowSizeSnapshot?"
+        },
+        {
+          "name": "Max",
+          "rust": "max",
+          "type": "WindowSizeSnapshot?"
+        }
+      ]
+    },
+    {
+      "name": "WindowSizeSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WindowSizeSnapshot",
+      "fields": [
+        {
+          "name": "Width",
+          "rust": "width",
+          "type": "int"
+        },
+        {
+          "name": "Height",
+          "rust": "height",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "WireBorderValue",
+      "semantic": "shojiwm_lib::ssd::bridge::WireBorderValue",
+      "fields": [
+        {
+          "name": "Px",
+          "rust": "px",
+          "type": "double"
+        },
+        {
+          "name": "Color",
+          "rust": "color",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "WireDecorationNode",
+      "semantic": "shojiwm_lib::ssd::bridge::WireDecorationNode",
+      "fields": [
+        {
+          "name": "Kind",
+          "rust": "kind",
+          "type": "string"
+        },
+        {
+          "name": "NodeId",
+          "rust": "node_id",
+          "type": "string?"
+        },
+        {
+          "name": "Props",
+          "rust": "props",
+          "type": "WireProps"
+        },
+        {
+          "name": "Children",
+          "rust": "children",
+          "type": "List<WireDecorationNode>"
+        }
+      ]
+    },
+    {
+      "name": "WireNodeTransform",
+      "semantic": "shojiwm_lib::ssd::bridge::WireNodeTransform",
+      "fields": [
+        {
+          "name": "TranslateX",
+          "rust": "translate_x",
+          "type": "float?"
+        },
+        {
+          "name": "TranslateY",
+          "rust": "translate_y",
+          "type": "float?"
+        },
+        {
+          "name": "Scale",
+          "rust": "scale",
+          "type": "float?"
+        },
+        {
+          "name": "ScaleX",
+          "rust": "scale_x",
+          "type": "float?"
+        },
+        {
+          "name": "ScaleY",
+          "rust": "scale_y",
+          "type": "float?"
+        }
+      ]
+    },
+    {
+      "name": "WireProps",
+      "semantic": "shojiwm_lib::ssd::bridge::WireProps",
+      "fields": [
+        {
+          "name": "Direction",
+          "rust": "direction",
+          "type": "string?"
+        },
+        {
+          "name": "Split",
+          "rust": "split",
+          "type": "string?"
+        },
+        {
+          "name": "Text",
+          "rust": "text",
+          "type": "string?"
+        },
+        {
+          "name": "Icon",
+          "rust": "icon",
+          "type": "JsonElement?"
+        },
+        {
+          "name": "Shader",
+          "rust": "shader",
+          "type": "JsonElement?"
+        },
+        {
+          "name": "Src",
+          "rust": "src",
+          "type": "string?"
+        },
+        {
+          "name": "Fit",
+          "rust": "fit",
+          "type": "string?"
+        },
+        {
+          "name": "Id",
+          "rust": "id",
+          "type": "string?"
+        },
+        {
+          "name": "Style",
+          "rust": "style",
+          "type": "WireStyle"
+        },
+        {
+          "name": "OnClick",
+          "rust": "on_click",
+          "type": "ClickDescriptor?"
+        },
+        {
+          "name": "OnHoverChange",
+          "rust": "on_hover_change",
+          "type": "WireStateChangeHandler?"
+        },
+        {
+          "name": "OnActiveChange",
+          "rust": "on_active_change",
+          "type": "WireStateChangeHandler?"
+        },
+        {
+          "name": "Interaction",
+          "rust": "interaction",
+          "type": "WireWindowBorderInteraction?"
+        }
+      ]
+    },
+    {
+      "name": "WireRuntimeHandler",
+      "semantic": "shojiwm_lib::ssd::bridge::WireRuntimeHandler",
+      "fields": [
+        {
+          "name": "Kind",
+          "rust": "kind",
+          "type": "string"
+        },
+        {
+          "name": "Id",
+          "rust": "id",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "WireStateChangeHandler",
+      "semantic": "shojiwm_lib::ssd::bridge::WireStateChangeHandler",
+      "fields": [
+        {
+          "name": "Kind",
+          "rust": "kind",
+          "type": "string"
+        },
+        {
+          "name": "TrueId",
+          "rust": "true_id",
+          "type": "string"
+        },
+        {
+          "name": "FalseId",
+          "rust": "false_id",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "WireStyle",
+      "semantic": "shojiwm_lib::ssd::bridge::WireStyle",
+      "fields": [
+        {
+          "name": "Width",
+          "rust": "width",
+          "type": "Dimension?"
+        },
+        {
+          "name": "Height",
+          "rust": "height",
+          "type": "Dimension?"
+        },
+        {
+          "name": "MinWidth",
+          "rust": "min_width",
+          "type": "double?"
+        },
+        {
+          "name": "MinHeight",
+          "rust": "min_height",
+          "type": "double?"
+        },
+        {
+          "name": "MaxWidth",
+          "rust": "max_width",
+          "type": "double?"
+        },
+        {
+          "name": "MaxHeight",
+          "rust": "max_height",
+          "type": "double?"
+        },
+        {
+          "name": "FlexGrow",
+          "rust": "flex_grow",
+          "type": "float?"
+        },
+        {
+          "name": "FlexShrink",
+          "rust": "flex_shrink",
+          "type": "float?"
+        },
+        {
+          "name": "Gap",
+          "rust": "gap",
+          "type": "double?"
+        },
+        {
+          "name": "Padding",
+          "rust": "padding",
+          "type": "double?"
+        },
+        {
+          "name": "PaddingX",
+          "rust": "padding_x",
+          "type": "double?"
+        },
+        {
+          "name": "PaddingY",
+          "rust": "padding_y",
+          "type": "double?"
+        },
+        {
+          "name": "PaddingTop",
+          "rust": "padding_top",
+          "type": "double?"
+        },
+        {
+          "name": "PaddingRight",
+          "rust": "padding_right",
+          "type": "double?"
+        },
+        {
+          "name": "PaddingBottom",
+          "rust": "padding_bottom",
+          "type": "double?"
+        },
+        {
+          "name": "PaddingLeft",
+          "rust": "padding_left",
+          "type": "double?"
+        },
+        {
+          "name": "Margin",
+          "rust": "margin",
+          "type": "double?"
+        },
+        {
+          "name": "MarginX",
+          "rust": "margin_x",
+          "type": "double?"
+        },
+        {
+          "name": "MarginY",
+          "rust": "margin_y",
+          "type": "double?"
+        },
+        {
+          "name": "MarginTop",
+          "rust": "margin_top",
+          "type": "double?"
+        },
+        {
+          "name": "MarginRight",
+          "rust": "margin_right",
+          "type": "double?"
+        },
+        {
+          "name": "MarginBottom",
+          "rust": "margin_bottom",
+          "type": "double?"
+        },
+        {
+          "name": "MarginLeft",
+          "rust": "margin_left",
+          "type": "double?"
+        },
+        {
+          "name": "Position",
+          "rust": "position",
+          "type": "string?"
+        },
+        {
+          "name": "ZIndex",
+          "rust": "z_index",
+          "type": "int?"
+        },
+        {
+          "name": "Inset",
+          "rust": "inset",
+          "type": "double?"
+        },
+        {
+          "name": "Top",
+          "rust": "top",
+          "type": "double?"
+        },
+        {
+          "name": "Right",
+          "rust": "right",
+          "type": "double?"
+        },
+        {
+          "name": "Bottom",
+          "rust": "bottom",
+          "type": "double?"
+        },
+        {
+          "name": "Left",
+          "rust": "left",
+          "type": "double?"
+        },
+        {
+          "name": "Overflow",
+          "rust": "overflow",
+          "type": "string?"
+        },
+        {
+          "name": "PointerEvents",
+          "rust": "pointer_events",
+          "type": "string?"
+        },
+        {
+          "name": "Transform",
+          "rust": "transform",
+          "type": "WireNodeTransform?"
+        },
+        {
+          "name": "AlignItems",
+          "rust": "align_items",
+          "type": "string?"
+        },
+        {
+          "name": "JustifyContent",
+          "rust": "justify_content",
+          "type": "string?"
+        },
+        {
+          "name": "Background",
+          "rust": "background",
+          "type": "string?"
+        },
+        {
+          "name": "Color",
+          "rust": "color",
+          "type": "string?"
+        },
+        {
+          "name": "Opacity",
+          "rust": "opacity",
+          "type": "float?"
+        },
+        {
+          "name": "Border",
+          "rust": "border",
+          "type": "WireBorderValue?"
+        },
+        {
+          "name": "BorderTop",
+          "rust": "border_top",
+          "type": "WireBorderValue?"
+        },
+        {
+          "name": "BorderRight",
+          "rust": "border_right",
+          "type": "WireBorderValue?"
+        },
+        {
+          "name": "BorderBottom",
+          "rust": "border_bottom",
+          "type": "WireBorderValue?"
+        },
+        {
+          "name": "BorderLeft",
+          "rust": "border_left",
+          "type": "WireBorderValue?"
+        },
+        {
+          "name": "BorderFit",
+          "rust": "border_fit",
+          "type": "string?"
+        },
+        {
+          "name": "BorderRadius",
+          "rust": "border_radius",
+          "type": "double?"
+        },
+        {
+          "name": "Visible",
+          "rust": "visible",
+          "type": "bool?"
+        },
+        {
+          "name": "Cursor",
+          "rust": "cursor",
+          "type": "string?"
+        },
+        {
+          "name": "FontSize",
+          "rust": "font_size",
+          "type": "double?"
+        },
+        {
+          "name": "FontWeight",
+          "rust": "font_weight",
+          "type": "JsonElement?"
+        },
+        {
+          "name": "FontFamily",
+          "rust": "font_family",
+          "type": "FontFamily?"
+        },
+        {
+          "name": "TextAlign",
+          "rust": "text_align",
+          "type": "string?"
+        },
+        {
+          "name": "LineHeight",
+          "rust": "line_height",
+          "type": "double?"
+        }
+      ]
+    },
+    {
+      "name": "WireWindowBorderInteraction",
+      "semantic": "shojiwm_lib::ssd::bridge::WireWindowBorderInteraction",
+      "fields": [
+        {
+          "name": "ResizeHitArea",
+          "rust": "resize_hit_area",
+          "type": "ResizeHitArea?"
+        }
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "OutputSubpixelSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::OutputSubpixelSnapshot",
+      "values": [
+        "Unknown",
+        "None",
+        "HorizontalRgb",
+        "HorizontalBgr",
+        "VerticalRgb",
+        "VerticalBgr"
+      ]
+    },
+    {
+      "name": "OutputTransformSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::OutputTransformSnapshot",
+      "values": [
+        "Normal",
+        "Rotate90",
+        "Rotate180",
+        "Rotate270",
+        "Flipped",
+        "Flipped90",
+        "Flipped180",
+        "Flipped270"
+      ]
+    },
+    {
+      "name": "WaylandWindowAction",
+      "semantic": "shojiwm_lib::ssd::window_model::WaylandWindowAction",
+      "values": [
+        "Close",
+        "FinalizeClose",
+        "Maximize",
+        "Unmaximize",
+        "Minimize",
+        "Fullscreen",
+        "Unfullscreen",
+        "Focus",
+        "ScheduleAnimation",
+        "CancelAnimation"
+      ]
+    },
+    {
+      "name": "WindowDecorationModeSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WindowDecorationModeSnapshot",
+      "values": [
+        "Client",
+        "Server"
+      ]
+    },
+    {
+      "name": "WindowDecorationProtocolSnapshot",
+      "semantic": "shojiwm_lib::ssd::window_model::WindowDecorationProtocolSnapshot",
+      "values": [
+        "XdgDecorationV1",
+        "KdeServerDecoration",
+        "Xwayland",
+        "None"
+      ]
+    },
+    {
+      "name": "WireWindowAction",
+      "semantic": "shojiwm_lib::ssd::bridge::WireWindowAction",
+      "values": [
+        "Close",
+        "Maximize",
+        "Unmaximize",
+        "Minimize"
+      ]
+    }
+  ]
+}

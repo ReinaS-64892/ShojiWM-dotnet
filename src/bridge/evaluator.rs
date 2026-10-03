@@ -9,7 +9,11 @@ use std::{
 
 use super::{
     host::InProcessDotNetHost,
-    protocol::{ExternalRuntimeRequest, ExternalRuntimeResponse},
+    native::{
+        BridgeError, EvaluateCachedRequest, EvaluateCandidatePreviewRequest,
+        EvaluatePreviewRequest, EvaluateRequest, EvaluationContext, EvaluationResponse,
+        InvokeHandlerRequest,
+    },
 };
 use shojiwm_lib::runtime_api::{RuntimeConfigDelta, RuntimeHost};
 use shojiwm_lib::runtime_input::RuntimeInputDeviceSnapshot;
@@ -52,9 +56,7 @@ impl Drop for PendingAssembly {
                 runtime_host: RuntimeHost::detached(),
             };
             if let Ok(mut state) = owner.lock() {
-                if let Err(error) =
-                    owner.request(&mut state, "abortAssembly", None, None, None, 0, None)
-                {
+                if let Err(error) = owner.use_host(&mut state, |host| host.abort_assembly()) {
                     tracing::warn!(%error, "failed to abort prepared C# assembly");
                 }
             }
@@ -65,7 +67,6 @@ impl Drop for PendingAssembly {
 #[derive(Debug, Default)]
 struct RuntimeState {
     host: Option<InProcessDotNetHost>,
-    next_request_id: u64,
     failure: Option<String>,
     displays: BTreeMap<String, WaylandOutputSnapshot>,
     inputs: BTreeMap<String, RuntimeInputDeviceSnapshot>,
@@ -131,16 +132,7 @@ impl DotNetDecorationEvaluator {
             let path = next.config.to_str().ok_or_else(|| {
                 DecorationEvaluationError::RuntimeProtocol("config path must be UTF-8".into())
             })?;
-            self.request_with_config(
-                &mut state,
-                "prepareAssembly",
-                None,
-                None,
-                None,
-                0,
-                None,
-                Some(path),
-            )?;
+            self.use_host(&mut state, |host| host.prepare_assembly(path.to_owned()))?;
         }
         Ok(next)
     }
@@ -153,7 +145,8 @@ impl DotNetDecorationEvaluator {
                 return Ok(());
             }
             let mut state = self.lock()?;
-            self.request(&mut state, "commitAssembly", None, None, None, 0, None)?;
+            let committed = self.use_host(&mut state, |host| host.commit_assembly())?;
+            self.publish_debug(committed.debug_config);
             state.windows.clear();
             pending.completed.store(true, Ordering::Release);
         }
@@ -164,12 +157,11 @@ impl DotNetDecorationEvaluator {
         &self,
         snapshot: &WaylandWindowSnapshot,
     ) -> Result<(), DecorationEvaluationError> {
-        let kind = if self.pending.is_some() {
-            "evaluateCandidatePreview"
+        if self.pending.is_some() {
+            self.render_candidate_preview(snapshot, 0).map(|_| ())
         } else {
-            "evaluatePreview"
-        };
-        self.render(snapshot, 0, kind).map(|_| ())
+            self.render_preview(snapshot, 0).map(|_| ())
+        }
     }
 
     pub(crate) fn window_snapshots(
@@ -211,154 +203,77 @@ impl DotNetDecorationEvaluator {
         })
     }
 
-    fn request(
+    // Shared host lifetime/error mechanics, never an operation discriminator.
+    fn use_host<T>(
         &self,
         state: &mut RuntimeState,
-        kind: &str,
-        snapshot: Option<&WaylandWindowSnapshot>,
-        window_id: Option<&str>,
-        handler_id: Option<&str>,
-        now_ms: u64,
-        reason: Option<&str>,
-    ) -> Result<ExternalRuntimeResponse, DecorationEvaluationError> {
-        self.request_with_config(
-            state, kind, snapshot, window_id, handler_id, now_ms, reason, None,
-        )
-    }
-
-    fn request_with_config(
-        &self,
-        state: &mut RuntimeState,
-        kind: &str,
-        snapshot: Option<&WaylandWindowSnapshot>,
-        window_id: Option<&str>,
-        handler_id: Option<&str>,
-        now_ms: u64,
-        reason: Option<&str>,
-        config_path: Option<&str>,
-    ) -> Result<ExternalRuntimeResponse, DecorationEvaluationError> {
+        call: impl FnOnce(&mut InProcessDotNetHost) -> Result<T, BridgeError>,
+    ) -> Result<T, DecorationEvaluationError> {
         if let Some(error) = &state.failure {
             return Err(DecorationEvaluationError::RuntimeProtocol(error.clone()));
         }
-        let mut managed_failure = false;
-        let result = (|| -> Result<ExternalRuntimeResponse, String> {
-            if state.host.is_none() {
-                state.host = Some(InProcessDotNetHost::start(&self.component, &self.config)?);
-            }
-            state.next_request_id = state
-                .next_request_id
-                .checked_add(1)
-                .ok_or("requestId exhausted")?;
-            let request_id = state.next_request_id;
-            let request = ExternalRuntimeRequest {
-                request_id,
-                kind,
-                snapshot,
-                window_id,
-                handler_id,
-                now_ms,
-                reason,
-                config_path,
-                display_state: &state.displays,
-                input_state: &state.inputs,
-            };
-            let bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-            let bytes = state
-                .host
-                .as_mut()
-                .ok_or("runtime host unavailable")?
-                .exchange(bytes)?;
-            let response = Self::decode_response(&bytes, kind, request_id)?;
-            if !response.ok {
-                managed_failure = true;
-                return Err(response
-                    .error
-                    .unwrap_or_else(|| "managed runtime returned failure".into()));
-            }
-            // Previews and prepare must never change the active compositor.
-            // The managed host buffers candidate updates until commit succeeds.
-            if !matches!(
-                kind,
-                "evaluatePreview" | "evaluateCandidatePreview" | "prepareAssembly"
-            ) {
-                RuntimeConfigDelta {
-                    debug_config: response.debug_config,
-                    ..Default::default()
+        if state.host.is_none() {
+            match InProcessDotNetHost::start(&self.component, &self.config) {
+                Ok(host) => state.host = Some(host),
+                Err(error) => {
+                    state.fail_host(error.clone());
+                    return Err(DecorationEvaluationError::RuntimeProtocol(error));
                 }
-                .publish(&self.runtime_host);
             }
-            Ok(response)
-        })();
-        if let Err(error) = &result
-            && !managed_failure
-        {
-            state.fail_host(error.clone());
         }
-        result.map_err(DecorationEvaluationError::RuntimeProtocol)
-    }
-
-    fn decode_response(
-        bytes: &[u8],
-        kind: &str,
-        request_id: u64,
-    ) -> Result<ExternalRuntimeResponse, String> {
-        let response: ExternalRuntimeResponse = serde_json::from_slice(bytes)
-            .map_err(|e| format!("invalid managed runtime response: {e}"))?;
-        if response.request_id != request_id || response.kind != kind {
-            return Err(format!(
-                "mismatched response: expected {kind}/{request_id}, got {}/{}",
-                response.kind, response.request_id
-            ));
+        let result = call(state.host.as_mut().expect("host initialized above"));
+        match result {
+            Ok(value) => Ok(value),
+            Err(BridgeError::Semantic(error)) => {
+                Err(DecorationEvaluationError::RuntimeProtocol(error))
+            }
+            Err(BridgeError::Host(error)) => {
+                state.fail_host(error.clone());
+                Err(DecorationEvaluationError::RuntimeProtocol(error))
+            }
         }
-        Ok(response)
     }
-
+    fn context(state: &RuntimeState, now_ms: u64) -> EvaluationContext {
+        EvaluationContext {
+            now_ms,
+            displays: state.displays.clone(),
+            inputs: state.inputs.clone(),
+        }
+    }
+    fn publish_debug(
+        &self,
+        debug_config: Option<shojiwm_lib::runtime_debug::RuntimeDebugConfigUpdate>,
+    ) {
+        RuntimeConfigDelta {
+            debug_config,
+            ..Default::default()
+        }
+        .publish(&self.runtime_host);
+    }
     pub fn preload(&self) -> Result<(), DecorationEvaluationError> {
         let mut state = self.lock()?;
-        self.request(&mut state, "drainPreload", None, None, None, 0, None)?;
-        Ok(())
+        self.use_host(&mut state, |host| host.drain_preload())
     }
-
     pub fn lifecycle_enable(
         &self,
         reason: &str,
     ) -> Result<DecorationHandlerInvocation, DecorationEvaluationError> {
         let mut state = self.lock()?;
-        let response = self.request(
-            &mut state,
-            "lifecycleEnable",
-            None,
-            None,
-            None,
-            0,
-            Some(reason),
-        )?;
+        let response =
+            self.use_host(&mut state, |host| host.lifecycle_enable(reason.to_owned()))?;
+        self.publish_debug(response.debug_config);
         Ok(DecorationHandlerInvocation {
             actions: response.actions,
             ..Default::default()
         })
     }
-
-    fn render(
-        &self,
-        snapshot: &WaylandWindowSnapshot,
-        now_ms: u64,
-        kind: &str,
+    fn evaluation_result(
+        response: EvaluationResponse,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        let mut state = self.lock()?;
-        let response = self.request(
-            &mut state,
-            kind,
-            Some(snapshot),
-            Some(&snapshot.id),
-            None,
-            now_ms,
-            None,
-        )?;
-        let node = Self::decode_response_tree(response.serialized, true)?.ok_or_else(|| {
+        let node = Self::decode_response_tree(Some(response.node), true)?.ok_or_else(|| {
             DecorationEvaluationError::RuntimeProtocol("missing composition tree".into())
         })?;
-        let result = DecorationEvaluationResult {
+        Ok(DecorationEvaluationResult {
             node,
             transform: WindowTransform::default(),
             managed_window: ManagedWindowState::default(),
@@ -366,15 +281,75 @@ impl DotNetDecorationEvaluator {
             dirty_node_ids: Vec::new(),
             next_poll_in_ms: None,
             actions: response.actions,
+        })
+    }
+    fn render(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+        let mut state = self.lock()?;
+        let request = EvaluateRequest {
+            snapshot: snapshot.clone(),
+            window_id: Some(snapshot.id.clone()),
+            context: Self::context(&state, now_ms),
         };
-        if !matches!(kind, "evaluatePreview" | "evaluateCandidatePreview") {
-            state
-                .windows
-                .insert(snapshot.id.clone(), (snapshot.clone(), result.clone()));
-        }
+        let response = self.use_host(&mut state, |host| host.evaluate(request))?;
+        let result = Self::evaluation_result(response)?;
+        state
+            .windows
+            .insert(snapshot.id.clone(), (snapshot.clone(), result.clone()));
         Ok(result)
     }
-
+    fn render_preview(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+        let mut state = self.lock()?;
+        let request = EvaluatePreviewRequest {
+            snapshot: snapshot.clone(),
+            window_id: Some(snapshot.id.clone()),
+            context: Self::context(&state, now_ms),
+        };
+        let response = self.use_host(&mut state, |host| host.evaluate_preview(request))?;
+        let result = Self::evaluation_result(response)?;
+        Ok(result)
+    }
+    fn render_candidate_preview(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+        let mut state = self.lock()?;
+        let request = EvaluateCandidatePreviewRequest {
+            snapshot: snapshot.clone(),
+            window_id: Some(snapshot.id.clone()),
+            context: Self::context(&state, now_ms),
+        };
+        let response =
+            self.use_host(&mut state, |host| host.evaluate_candidate_preview(request))?;
+        let result = Self::evaluation_result(response)?;
+        Ok(result)
+    }
+    fn render_cached(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+        let mut state = self.lock()?;
+        let request = EvaluateCachedRequest {
+            snapshot: Some(snapshot.clone()),
+            window_id: snapshot.id.clone(),
+            context: Self::context(&state, now_ms),
+        };
+        let response = self.use_host(&mut state, |host| host.evaluate_cached(request))?;
+        let result = Self::evaluation_result(response)?;
+        state
+            .windows
+            .insert(snapshot.id.clone(), (snapshot.clone(), result.clone()));
+        Ok(result)
+    }
     fn decode_response_tree(
         wire: Option<shojiwm_lib::ssd::WireDecorationNode>,
         required: bool,
@@ -407,7 +382,7 @@ impl DecorationEvaluator for DotNetDecorationEvaluator {
         snapshot: &WaylandWindowSnapshot,
         now_ms: u64,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        self.render(snapshot, now_ms, "evaluate")
+        self.render(snapshot, now_ms)
     }
 
     fn evaluate_window_preview(
@@ -415,7 +390,7 @@ impl DecorationEvaluator for DotNetDecorationEvaluator {
         snapshot: &WaylandWindowSnapshot,
         now_ms: u64,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        self.render(snapshot, now_ms, "evaluatePreview")
+        self.render_preview(snapshot, now_ms)
     }
 
     fn evaluate_cached_window(
@@ -431,9 +406,7 @@ impl DecorationEvaluator for DotNetDecorationEvaluator {
                     "cached snapshot windowId mismatch".into(),
                 ));
             }
-            return self
-                .render(snapshot, now_ms, "evaluateCached")
-                .map(Into::into);
+            return self.render_cached(snapshot, now_ms).map(Into::into);
         }
         let state = self.lock()?;
         if let Some(error) = &state.failure {
@@ -446,9 +419,7 @@ impl DecorationEvaluator for DotNetDecorationEvaluator {
         })?;
         drop(state);
         if force_full {
-            return self
-                .render(&snapshot, now_ms, "evaluateCached")
-                .map(Into::into);
+            return self.render_cached(&snapshot, now_ms).map(Into::into);
         }
         let mut cached: DecorationCachedEvaluationResult = result.into();
         cached.node = None;
@@ -463,23 +434,20 @@ impl DecorationEvaluator for DotNetDecorationEvaluator {
         now_ms: u64,
     ) -> Result<DecorationHandlerInvocation, DecorationEvaluationError> {
         let mut state = self.lock()?;
-        let response = self.request(
-            &mut state,
-            "invokeHandler",
-            None,
-            Some(window_id),
-            Some(handler_id),
-            now_ms,
-            None,
-        )?;
-        let node = Self::decode_response_tree(response.serialized, false)?;
+        let request = InvokeHandlerRequest {
+            window_id: window_id.to_owned(),
+            handler_id: handler_id.to_owned(),
+            context: Self::context(&state, now_ms),
+        };
+        let response = self.use_host(&mut state, |host| host.invoke_handler(request))?;
+        let node = Self::decode_response_tree(response.node, false)?;
         if let Some(node) = &node {
             if let Some((_, cached)) = state.windows.get_mut(window_id) {
                 cached.node = node.clone();
             }
         }
         Ok(DecorationHandlerInvocation {
-            invoked: response.invoked.unwrap_or(false),
+            invoked: response.invoked,
             node,
             actions: response.actions,
             ..Default::default()
@@ -489,15 +457,7 @@ impl DecorationEvaluator for DotNetDecorationEvaluator {
     fn window_closed(&self, window_id: &str) -> Result<(), DecorationEvaluationError> {
         let mut state = self.lock()?;
         state.windows.remove(window_id);
-        self.request(
-            &mut state,
-            "windowClosed",
-            None,
-            Some(window_id),
-            None,
-            0,
-            None,
-        )?;
+        self.use_host(&mut state, |host| host.window_closed(window_id.to_owned()))?;
         Ok(())
     }
 }
@@ -544,28 +504,6 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(serde_json::to_value(snapshot()).unwrap(), fixture);
-    }
-
-    #[test]
-    fn malformed_and_mismatched_json_responses_are_errors() {
-        for json in [
-            "bad json",
-            "{}",
-            r#"{"requestId":2,"kind":"evaluate","ok":true}"#,
-            r#"{"requestId":1,"kind":"unknown","ok":true}"#,
-        ] {
-            assert!(
-                DotNetDecorationEvaluator::decode_response(json.as_bytes(), "evaluate", 1).is_err()
-            );
-        }
-        assert!(
-            DotNetDecorationEvaluator::decode_response(
-                br#"{"requestId":1,"kind":"evaluate","ok":true}"#,
-                "evaluate",
-                1
-            )
-            .is_ok()
-        );
     }
 
     #[test]

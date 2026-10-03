@@ -7,7 +7,6 @@ name = "ShojiWM-dotnet"
 version = "0.1.0"
 dependencies = [
  "netcorehost",
- "serde",
  "serde_json",
  "shojiwm_lib",
  "tracing",

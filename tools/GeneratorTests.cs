@@ -50,7 +50,7 @@ internal static class GeneratorTests
         Test("production numeric/optional/wire mappings", () =>
         {
             string output = BindingGenerator.Generate(root);
-            foreach (string expected in new[] { "required ulong RequestId", "string? AppId", "List<byte>? Bytes",
+            foreach (string expected in new[] { "uint? Vendor", "string? AppId", "List<byte>? Bytes",
                 "JsonStringEnumMemberName(\"xdg-decoration-v1\")", "JsonPropertyName(\"switch\")" })
                 Contains(output, expected);
         });
@@ -102,11 +102,11 @@ internal static class GeneratorTests
             });
             foreach (var (name, oldText, newText, error) in new (string, string, string, string)[]
             {
-                ("unknown Rust type", "pub kind: &'a str", "pub kind: HashSet<String>", "unsupported Rust type"),
+                ("unknown Rust type", "pub kind: String", "pub kind: HashSet<String>", "unsupported Rust type"),
                 ("unknown serde attribute", "rename_all = \"camelCase\"", "deny_unknown_fields", "unsupported serde attribute"),
                 ("unknown rename mode", "rename_all = \"camelCase\"", "rename_all = \"SCREAMING_SNAKE_CASE\"", "unsupported rename_all"),
-                ("non-public field", "pub request_id: u64", "request_id: u64", "unsupported field"),
-                ("unclosed model", "pub debug_config: Option<RuntimeDebugConfigUpdate>,\n}", "pub debug_config: Option<RuntimeDebugConfigUpdate>,", "unclosed model"),
+                ("non-public field", "pub node_id: Option<String>", "node_id: Option<String>", "unsupported field"),
+                ("unclosed model", "pub id: String,\n}", "pub id: String,", "unclosed model"),
             })
             {
                 Test($"fail closed: {name}", () =>
@@ -147,10 +147,56 @@ internal static class GeneratorTests
             });
             Test("invalid schema never overwrites existing output", () =>
             {
-                File.WriteAllText(path, original.Replace("pub kind: &'a str", "pub kind: HashSet<String>"));
+                File.WriteAllText(path, original.Replace("pub kind: String", "pub kind: HashSet<String>"));
                 Fails(() => BindingGenerator.Write(fixture.Root), "unsupported Rust type");
                 Equal(expected, File.ReadAllText(Path.Combine(fixture.Root, BindingGenerator.Output)));
                 File.WriteAllText(path, original);
+            });
+        }
+        using (var fixture = new Fixture(root))
+        {
+            string manifest = Path.Combine(fixture.Root, "tools/NativeAbi.schema.json");
+            string original = File.ReadAllText(manifest);
+            Test("native ABI generation and read-only check", () => {
+                Fails(() => NativeAbiGenerator.Run(fixture.Root, true), "stale");
+                NativeAbiGenerator.Run(fixture.Root, false);
+                NativeAbiGenerator.Run(fixture.Root, true);
+                string output = Path.Combine(fixture.Root, "src/bridge/native_generated.rs");
+                File.SetLastWriteTimeUtc(output, new DateTime(2020, 1, 1));
+                NativeAbiGenerator.Run(fixture.Root, false);
+                if (File.GetLastWriteTimeUtc(output).Year != 2020) throw new Exception("native output rewritten");
+                Contains(File.ReadAllText(output), "manifest_layouts");
+            });
+            Test("native ABI unknown types fail before writes", () => {
+                string output = Path.Combine(fixture.Root, "src/bridge/native_generated.rs"), before = File.ReadAllText(output);
+                File.WriteAllText(manifest, original.Replace("List<byte>", "List<UnknownAbiType>"));
+                Fails(() => NativeAbiGenerator.Run(fixture.Root, false), "unsupported ABI type");
+                Equal(before, File.ReadAllText(output));
+                File.WriteAllText(manifest, original);
+            });
+        }
+        using (var fixture = new Fixture(root))
+        {
+            string output = Path.Combine(fixture.Root, NativeOperationGenerator.EntryOutput);
+            Test("operation generation check is read-only and detects missing output", () => {
+                Fails(() => NativeOperationGenerator.Run(fixture.Root, true), "stale");
+                if (File.Exists(output)) throw new Exception("operation check wrote output");
+                NativeOperationGenerator.Run(fixture.Root, false);
+                NativeOperationGenerator.Run(fixture.Root, true);
+            });
+            Test("operation generation is deterministic and preserves unchanged timestamp", () => {
+                File.SetLastWriteTimeUtc(output, new DateTime(2020, 1, 1));
+                string before = File.ReadAllText(output);
+                NativeOperationGenerator.Run(fixture.Root, false);
+                Equal(before, File.ReadAllText(output));
+                if (File.GetLastWriteTimeUtc(output).Year != 2020) throw new Exception("operation output rewritten");
+            });
+            Test("stale operation check preserves output until regenerated", () => {
+                File.WriteAllText(output, "stale");
+                Fails(() => NativeOperationGenerator.Run(fixture.Root, true), "stale");
+                Equal("stale", File.ReadAllText(output));
+                NativeOperationGenerator.Run(fixture.Root, false);
+                NativeOperationGenerator.Run(fixture.Root, true);
             });
         }
         Test("subprocess propagates nonzero exit", () =>
@@ -186,7 +232,7 @@ internal static class GeneratorTests
         internal string Root { get; } = Path.Combine(Path.GetTempPath(), "shoji-generator tests " + Guid.NewGuid().ToString("N"));
         internal Fixture(string root)
         {
-            foreach (string source in BindingGenerator.Sources)
+            foreach (string source in BindingGenerator.Sources.Append("tools/NativeAbi.schema.json"))
             {
                 string target = Path.Combine(Root, source);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);

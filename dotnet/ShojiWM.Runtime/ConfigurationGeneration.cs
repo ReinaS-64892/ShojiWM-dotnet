@@ -23,7 +23,7 @@ internal sealed class ConfigurationGeneration
         {
             // Convert errors to host-owned strings; an Exception/Type from the
             // config must never survive in the host and root its failed ALC.
-            var message = error.GetBaseException().Message;
+            var message = error.ToString();
             retired.Add(generation.Release("load-failed"));
             throw new ConfigurationException("assemblyLoad", message);
         }
@@ -36,14 +36,10 @@ internal sealed class ConfigurationGeneration
         session = null;
         if (previousSession is not null)
         {
-            var response = previousSession.Handle(new()
-            {
-                Kind = "lifecycleDisable", RequestId = 0, Reason = reason, NowMs = 0,
-                DisplayState = [], InputState = [],
-            });
-            if (!response.Ok) Console.Error.WriteLine($"ShojiWM .NET shutdown: {response.Error}");
+            try { previousSession.LifecycleDisable(new(reason)); }
+            catch (Exception error) { Console.Error.WriteLine($"ShojiWM .NET shutdown: {error}"); }
             try { previousSession.Dispose(); }
-            catch (Exception error) { Console.Error.WriteLine($"ShojiWM .NET dispose: {error.Message}"); }
+            catch (Exception error) { Console.Error.WriteLine($"ShojiWM .NET dispose: {error}"); }
         }
         var previousLoader = loader;
         loader = null;

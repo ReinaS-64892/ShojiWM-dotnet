@@ -13,13 +13,19 @@ public abstract class CompositionNode
     protected abstract string Kind { get; }
     protected virtual WireProps Props(Func<string, Action, string> register, string path) => new() { Id = Id, Style = Style ?? new() };
 
-    public WireDecorationNode ToWire(Func<string, Action, string> register, string path = "root") => new()
+    public WireDecorationNode ToWire(Func<string, Action, string> register, string path = "root") => ToWireCore(register, path, 0);
+
+    private WireDecorationNode ToWireCore(Func<string, Action, string> register, string path, int depth)
+    {
+        if (depth > 30) throw new InvalidOperationException("decoration tree maximum depth exceeded");
+        return new()
     {
         Kind = Kind,
         NodeId = path,
         Props = Props(register, path),
-        Children = Children.Select((child, index) => child.ToWire(register, $"{path}.{index}")).ToList(),
-    };
+        Children = Children.Select((child, index) => child.ToWireCore(register, $"{path}.{index}", depth + 1)).ToList(),
+        };
+    }
 }
 
 public sealed class WindowBorder : CompositionNode

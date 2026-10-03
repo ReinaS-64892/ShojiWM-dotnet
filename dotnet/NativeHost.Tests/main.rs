@@ -1,37 +1,110 @@
 #[path = "../../src/bridge/host.rs"]
 mod host;
 use host::InProcessDotNetHost;
-use serde_json::{Value, json};
+use serde_json::json;
+#[path = "../../src/bridge/arena.rs"]
+mod arena;
+#[path = "../../src/bridge/native.rs"]
+mod native;
+#[path = "../../src/bridge/native_generated.rs"]
+mod native_generated;
 use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-fn request(
-    host: &Arc<Mutex<InProcessDotNetHost>>,
-    kind: &str,
-    id: u64,
-    config: Option<&PathBuf>,
-    handler: Option<&str>,
-) -> Value {
-    let snapshot: Value =
-        serde_json::from_str(include_str!("../ShojiWM.Tests/Fixtures/window.json")).unwrap();
-    let bytes = serde_json::to_vec(&json!({"kind":kind, "requestId":id, "nowMs":1234,
-        "displayState":{}, "inputState":{}, "snapshot":snapshot, "windowId":"1",
-        "configPath":config, "handlerId":handler, "reason":"initial"}))
-    .unwrap();
-    let response = host.lock().unwrap().exchange(bytes).unwrap();
-    let value: Value = serde_json::from_slice(&response).unwrap();
-    assert_eq!(value["requestId"], id);
-    assert_eq!(value["kind"], kind);
-    value
-}
-fn handler(tree: &Value) -> Option<&str> {
-    if tree["kind"] == "Button" {
-        return tree["props"]["onClick"]["id"].as_str();
+fn snapshot() -> shojiwm_lib::ssd::WaylandWindowSnapshot {
+    use shojiwm_lib::ssd::{WaylandWindowSnapshot, window_model::WindowPositionSnapshot};
+    let rect = WindowPositionSnapshot {
+        x: 0.5,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+    WaylandWindowSnapshot {
+        id: "1".into(),
+        title: "Kitty 日本語".into(),
+        app_id: Some("kitty".into()),
+        position: rect,
+        rect,
+        is_focused: true,
+        is_floating: true,
+        is_maximized: false,
+        is_fullscreen: false,
+        is_xwayland: false,
+        decoration: Default::default(),
+        size_constraints: Default::default(),
+        is_resizable: true,
+        is_transient: false,
+        parent_id: None,
+        icon: None,
+        interaction: Default::default(),
     }
-    tree["children"].as_array()?.iter().find_map(handler)
+}
+fn context() -> native::EvaluationContext {
+    native::EvaluationContext {
+        now_ms: 1234,
+        ..Default::default()
+    }
+}
+fn evaluate(
+    host: &Arc<Mutex<InProcessDotNetHost>>,
+) -> Result<native::EvaluationResponse, native::BridgeError> {
+    host.lock().unwrap().evaluate(native::EvaluateRequest {
+        snapshot: snapshot(),
+        window_id: Some("1".into()),
+        context: context(),
+    })
+}
+fn candidate_preview(
+    host: &Arc<Mutex<InProcessDotNetHost>>,
+) -> Result<native::EvaluationResponse, native::BridgeError> {
+    host.lock()
+        .unwrap()
+        .evaluate_candidate_preview(native::EvaluateCandidatePreviewRequest {
+            snapshot: snapshot(),
+            window_id: Some("1".into()),
+            context: context(),
+        })
+}
+fn prepare(
+    host: &Arc<Mutex<InProcessDotNetHost>>,
+    path: &PathBuf,
+) -> Result<(), native::BridgeError> {
+    host.lock()
+        .unwrap()
+        .prepare_assembly(path.to_str().unwrap().to_owned())
+}
+fn invoke(
+    host: &Arc<Mutex<InProcessDotNetHost>>,
+    id: &str,
+) -> Result<native::HandlerResponse, native::BridgeError> {
+    host.lock()
+        .unwrap()
+        .invoke_handler(native::InvokeHandlerRequest {
+            window_id: "1".into(),
+            handler_id: id.into(),
+            context: context(),
+        })
+}
+fn child(
+    tree: &shojiwm_lib::ssd::WireDecorationNode,
+    index: usize,
+) -> &shojiwm_lib::ssd::WireDecorationNode {
+    match &tree.children[index] {
+        shojiwm_lib::ssd::bridge::WireDecorationChild::Node(n) => n,
+        _ => panic!("primitive unsupported"),
+    }
+}
+fn handler(tree: &shojiwm_lib::ssd::WireDecorationNode) -> Option<&str> {
+    if let Some(shojiwm_lib::ssd::bridge::WireOnClick::RuntimeHandler(h)) = &tree.props.on_click {
+        return Some(&h.id);
+    }
+    tree.children.iter().find_map(|c| match c {
+        shojiwm_lib::ssd::bridge::WireDecorationChild::Node(n) => handler(n),
+        _ => None,
+    })
 }
 fn env(name: &str, value: &str) {
     // Test fixture environment is changed only while no managed callback is
@@ -83,10 +156,39 @@ fn main() {
     // Reject a second owner without shutting down or replacing the active singleton.
     let duplicate = InProcessDotNetHost::start(&runtime, &fixture).unwrap_err();
     assert!(duplicate.contains("already initialized"), "{duplicate}");
-    assert!(request(&host, "lifecycleEnable", 1, None, None)["ok"] == true);
-    let first = request(&host, "evaluate", 2, None, None);
-    assert_eq!(first["serialized"]["children"][0]["props"]["text"], text);
-    let mut previous = handler(&first["serialized"]).unwrap().to_owned();
+    let enabled = host
+        .lock()
+        .unwrap()
+        .lifecycle_enable("initial".into())
+        .unwrap();
+    assert!(enabled.debug_config.is_some());
+    let first = evaluate(&host).unwrap();
+    assert_eq!(child(&first.node, 0).props.text.as_deref().unwrap(), text);
+    let preview = host
+        .lock()
+        .unwrap()
+        .evaluate_preview(native::EvaluatePreviewRequest {
+            snapshot: snapshot(),
+            window_id: Some("1".into()),
+            context: context(),
+        })
+        .unwrap();
+    assert!(preview.actions.is_empty());
+    let cached = host
+        .lock()
+        .unwrap()
+        .evaluate_cached(native::EvaluateCachedRequest {
+            snapshot: None,
+            window_id: "1".into(),
+            context: context(),
+        })
+        .unwrap();
+    assert_eq!(
+        child(&cached.node, 0).props.text,
+        child(&first.node, 0).props.text
+    );
+    assert!(host.lock().unwrap().drain_preload().is_ok());
+    let mut previous = handler(&first.node).unwrap().to_owned();
     let mut ids = HashSet::from([previous.clone()]);
     for generation in 0..20 {
         settings(&format!("generation-{generation}"), "");
@@ -95,84 +197,79 @@ fn main() {
         // Reload called from a different Rust thread still enters the same
         // managed host thread. No native delegate points into the config ALC.
         std::thread::spawn(move || {
-            assert!(request(&clone, "prepareAssembly", 10, Some(&path), None)["ok"] == true);
-            assert!(request(&clone, "evaluateCandidatePreview", 11, None, None)["ok"] == true);
-            assert!(request(&clone, "commitAssembly", 12, None, None)["ok"] == true);
+            assert!(prepare(&clone, &path).is_ok());
+            assert!(candidate_preview(&clone).is_ok());
+            assert!(clone.lock().unwrap().commit_assembly().is_ok());
         })
         .join()
         .unwrap();
-        assert!(request(&host, "invokeHandler", 13, None, Some(&previous))["invoked"] == false);
-        let tree = request(&host, "evaluate", 14, None, None);
+        assert!(invoke(&host, &previous).unwrap().invoked == false);
+        let tree = evaluate(&host).unwrap();
         assert_eq!(
-            tree["serialized"]["children"][0]["props"]["text"],
+            child(&tree.node, 0).props.text.as_deref().unwrap(),
             format!("generation-{generation}")
         );
-        previous = handler(&tree["serialized"]).unwrap().into();
+        previous = handler(&tree.node).unwrap().into();
         assert!(ids.insert(previous.clone()));
-        let action = request(&host, "invokeHandler", 15, None, Some(&previous));
-        assert!(action["invoked"] == true);
-        assert_eq!(action["actions"][0]["action"], "close");
+        let action = invoke(&host, &previous).unwrap();
+        assert!(action.invoked);
+        assert_eq!(
+            action.actions[0].action,
+            shojiwm_lib::ssd::WaylandWindowAction::Close
+        );
     }
     // Size guards replace pipe-line limits, including oversized managed output.
-    settings(&"x".repeat(host::MAX_MESSAGE_BYTES + 1), "");
-    assert!(request(&host, "prepareAssembly", 16, Some(&fixture), None)["ok"] == true);
-    let snapshot: Value =
-        serde_json::from_str(include_str!("../ShojiWM.Tests/Fixtures/window.json")).unwrap();
-    let preview = serde_json::to_vec(&json!({"kind":"evaluateCandidatePreview","requestId":17,"snapshot":snapshot,"windowId":"1","nowMs":0,"displayState":{},"inputState":{}})).unwrap();
-    let oversized: Value =
-        serde_json::from_slice(&host.lock().unwrap().exchange(preview).unwrap()).unwrap();
-    assert!(oversized["ok"] == false);
-    assert_eq!(oversized["requestId"], 17);
-    assert!(oversized["error"].as_str().unwrap().contains("8 MiB"));
-    assert!(request(&host, "abortAssembly", 18, None, None)["ok"] == true);
+    settings(&"x".repeat(arena::MAX_ARENA_SIZE + 1), "");
+    assert!(prepare(&host, &fixture).is_ok());
+    let oversized = candidate_preview(&host);
+    assert!(!oversized.is_ok());
+    assert!(oversized.unwrap_err().to_string().contains("8 MiB"));
+    assert!(host.lock().unwrap().abort_assembly().is_ok());
     for failure in ["constructor", "enable", "render"] {
         settings("candidate", failure);
-        let prepare = request(&host, "prepareAssembly", 20, Some(&fixture), None);
+        let prepare = prepare(&host, &fixture);
         if failure == "render" {
-            assert!(prepare["ok"] == true);
-            assert!(request(&host, "evaluateCandidatePreview", 21, None, None)["ok"] == false);
-            assert!(request(&host, "abortAssembly", 22, None, None)["ok"] == true);
+            assert!(prepare.is_ok());
+            assert!(candidate_preview(&host).is_err());
+            assert!(host.lock().unwrap().abort_assembly().is_ok());
         } else {
-            assert!(prepare["ok"] == false);
+            assert!(prepare.is_err());
         }
-        assert!(request(&host, "evaluate", 23, None, None)["ok"] == true);
+        assert!(evaluate(&host).is_ok());
     }
     settings("accepted", "");
     let broken = root.join("broken.dll");
     std::fs::write(&broken, b"broken bytes").unwrap();
     for path in [broken, root.join("missing.dll"), runtime.clone()] {
-        assert!(request(&host, "prepareAssembly", 25, Some(&path), None)["ok"] == false);
-        assert!(request(&host, "evaluate", 26, None, None)["ok"] == true);
+        assert!(prepare(&host, &path).is_err());
+        assert!(evaluate(&host).is_ok());
     }
     settings("leaked", "leak");
-    assert!(request(&host, "prepareAssembly", 30, Some(&fixture), None)["ok"] == true);
-    assert!(request(&host, "commitAssembly", 31, None, None)["ok"] == true);
+    assert!(prepare(&host, &fixture).is_ok());
+    assert!(host.lock().unwrap().commit_assembly().is_ok());
     settings("accepted", "");
-    assert!(request(&host, "prepareAssembly", 32, Some(&fixture), None)["ok"] == true);
-    assert!(request(&host, "commitAssembly", 33, None, None)["ok"] == true);
-    let refusal = request(&host, "prepareAssembly", 34, Some(&fixture), None);
-    assert!(refusal["ok"] == false);
+    assert!(prepare(&host, &fixture).is_ok());
+    assert!(host.lock().unwrap().commit_assembly().is_ok());
+    let refusal = prepare(&host, &fixture);
+    assert!(refusal.is_err());
     assert!(
-        refusal["error"]
-            .as_str()
-            .unwrap()
+        refusal
+            .unwrap_err()
+            .to_string()
             .contains("still referenced")
     );
-    let tree = request(&host, "evaluate", 35, None, None);
-    let id = handler(&tree["serialized"]).unwrap();
-    assert!(request(&host, "invokeHandler", 36, None, Some(id))["ok"] == true);
-    assert!(request(&host, "prepareAssembly", 37, Some(&fixture), None)["ok"] == true);
-    assert!(request(&host, "abortAssembly", 38, None, None)["ok"] == true);
-    assert!(
-        host.lock()
-            .unwrap()
-            .exchange(vec![b'x'; host::MAX_MESSAGE_BYTES + 1])
-            .is_err()
-    );
-    let malformed = host.lock().unwrap().exchange(b"bad json".to_vec()).unwrap();
-    assert!(serde_json::from_slice::<Value>(&malformed).unwrap()["ok"] == false);
-    assert!(host.lock().unwrap().exchange(vec![0xff]).is_err());
-    assert!(request(&host, "shutdownAssemblies", 40, None, None)["ok"] == true);
+    let tree = evaluate(&host).unwrap();
+    let id = handler(&tree.node).unwrap();
+    assert!(invoke(&host, id).is_ok());
+    assert!(prepare(&host, &fixture).is_ok());
+    assert!(host.lock().unwrap().abort_assembly().is_ok());
+    host.lock().unwrap().window_closed("1".into()).unwrap();
+    assert!(!invoke(&host, id).unwrap().invoked);
+    host.lock()
+        .unwrap()
+        .lifecycle_disable("test".into())
+        .unwrap();
+    assert!(host.lock().unwrap().shutdown_assemblies().is_ok());
     drop(host);
     let trace = std::fs::read_to_string(threads).unwrap();
     let lines: Vec<_> = trace.lines().collect();
@@ -215,6 +312,6 @@ fn main() {
     }
     std::fs::remove_dir_all(root).unwrap();
     println!(
-        "PASS hostfxr bootstrap, API identity, UTF-8 JSON, handlers/actions, 20 reloads, rollback, leak/refusal/retry, buffers and single managed thread"
+        "PASS hostfxr bootstrap, API identity, UTF-8 arena ABI, handlers/actions, 20 reloads, rollback, leak/refusal/retry, buffers and single managed thread"
     );
 }
