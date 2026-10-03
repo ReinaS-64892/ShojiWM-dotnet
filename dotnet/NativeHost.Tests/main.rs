@@ -45,7 +45,7 @@ fn main() {
     let runtime = PathBuf::from(&args[1]);
     let original = PathBuf::from(&args[2]);
     let root = std::env::temp_dir().join(format!(
-        "shoji-native-test-{}-{}",
+        "shoji-native-test-日本語-🙂-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -74,13 +74,15 @@ fn main() {
     let disposal = root.join("disposal.log");
     env("SHOJI_TEST_THREAD_MARKER", threads.to_str().unwrap());
     env("SHOJI_TEST_CONFIG_MARKER", disposal.to_str().unwrap());
-    settings("initial", "");
+    let text = "日本語・é・🙂\0末尾";
+    settings(text, "");
     assert!(InProcessDotNetHost::start(&runtime, &root.join("missing.dll")).is_err());
     let host = Arc::new(Mutex::new(
         InProcessDotNetHost::start(&runtime.with_extension(""), &fixture).unwrap(),
     ));
     assert!(request(&host, "lifecycleEnable", 1, None, None)["ok"] == true);
     let first = request(&host, "evaluate", 2, None, None);
+    assert_eq!(first["serialized"]["children"][0]["props"]["text"], text);
     let mut previous = handler(&first["serialized"]).unwrap().to_owned();
     let mut ids = HashSet::from([previous.clone()]);
     for generation in 0..20 {
@@ -166,6 +168,7 @@ fn main() {
     );
     let malformed = host.lock().unwrap().exchange(b"bad json".to_vec()).unwrap();
     assert!(serde_json::from_slice::<Value>(&malformed).unwrap()["ok"] == false);
+    assert!(host.lock().unwrap().exchange(vec![0xff]).is_err());
     assert!(request(&host, "shutdownAssemblies", 40, None, None)["ok"] == true);
     drop(host);
     let trace = std::fs::read_to_string(threads).unwrap();

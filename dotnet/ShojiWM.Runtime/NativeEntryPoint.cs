@@ -1,18 +1,19 @@
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Text.Json;
 using ShojiWM.Wire;
 
 namespace ShojiWM.Runtime;
 
 /// Permanent bootstrap exports. All calls for a handle belong to its creating
-/// OS thread. Inputs are borrowed for the call; outputs must use FreeBuffer.
+/// OS thread. RustString inputs are borrowed for the call; DotnetString outputs
+/// transfer ownership to Rust and must use FreeDotnetString, even on failure.
 public static unsafe class NativeEntryPoint
 {
     public const int MaxMessageBytes = 8 * 1024 * 1024;
-    // Construct inside the guarded call, avoiding an allocating type initializer
-    // that could fail before an unmanaged entry point's catch block is entered.
-    private static UTF8Encoding Utf8 => new(false, true);
+    public const uint AbiVersion = 2;
+
+    [UnmanagedCallersOnly]
+    public static uint GetAbiVersion() => AbiVersion;
     private sealed class HostOwner(string path)
     {
         public readonly ConfigurationHost Host = new(path);
@@ -20,33 +21,34 @@ public static unsafe class NativeEntryPoint
     }
 
     [UnmanagedCallersOnly]
-    public static int CreateHost(byte* path, int length, nint* handle, byte** error, int* errorLength)
+    public static int CreateHost(RustString path, nint* handle, DotnetString* error)
     {
-        if (handle == null || error == null || errorLength == null) return -1;
-        *handle = 0; *error = null; *errorLength = 0;
+        if (handle != null) *handle = 0;
+        if (error != null) *error = default;
+        if (handle == null || error == null) return -1;
         try
         {
-            var owner = new HostOwner(Read(path, length));
+            var owner = new HostOwner(path.ToManagedString());
             try { *handle = GCHandle.ToIntPtr(GCHandle.Alloc(owner)); }
             catch { owner.Host.Dispose(); throw; }
             return 0;
         }
-        catch (Exception exception) { return Failure(exception, error, errorLength); }
+        catch (Exception exception) { return Failure(exception, error); }
     }
 
     [UnmanagedCallersOnly]
-    public static int Invoke(nint handle, byte* request, int length, byte** response, int* responseLength)
+    public static int Invoke(nint handle, RustString request, DotnetString* response)
     {
-        if (response == null || responseLength == null) return -1;
-        *response = null; *responseLength = 0;
+        if (response == null) return -1;
+        *response = default;
         try
         {
             var host = Owner(handle).Host;
-            var json = Read(request, length);
+            var json = request.ToManagedString();
             try
             {
                 var result = host.HandleJson(json);
-                Write(JsonSerializer.SerializeToUtf8Bytes(result, WireJson.Options), response, responseLength);
+                *response = DotnetString.CopyFromUtf8(JsonSerializer.SerializeToUtf8Bytes(result, WireJson.Options));
             }
             catch (Exception exception)
             {
@@ -59,18 +61,18 @@ public static unsafe class NativeEntryPoint
                 if (document.RootElement.TryGetProperty("requestId", out var value)) value.TryGetUInt64(out id);
                 if (document.RootElement.TryGetProperty("kind", out value) && value.ValueKind == JsonValueKind.String) kind = value.GetString()!;
                 var failure = new ExternalRuntimeResponse { RequestId = id, Kind = kind, Ok = false, Error = Diagnostic(exception), Actions = [] };
-                Write(JsonSerializer.SerializeToUtf8Bytes(failure, WireJson.Options), response, responseLength);
+                *response = DotnetString.CopyFromUtf8(JsonSerializer.SerializeToUtf8Bytes(failure, WireJson.Options));
             }
             return 0;
         }
-        catch (Exception exception) { return Failure(exception, response, responseLength); }
+        catch (Exception exception) { return Failure(exception, response); }
     }
 
     [UnmanagedCallersOnly]
-    public static int DestroyHost(nint handle, byte** error, int* errorLength)
+    public static int DestroyHost(nint handle, DotnetString* error)
     {
-        if (error == null || errorLength == null) return -1;
-        *error = null; *errorLength = 0;
+        if (error == null) return -1;
+        *error = default;
         try
         {
             var owner = Owner(handle);
@@ -78,13 +80,13 @@ public static unsafe class NativeEntryPoint
             finally { GCHandle.FromIntPtr(handle).Free(); }
             return 0;
         }
-        catch (Exception exception) { return Failure(exception, error, errorLength); }
+        catch (Exception exception) { return Failure(exception, error); }
     }
 
     [UnmanagedCallersOnly]
-    public static void FreeBuffer(byte* buffer)
+    public static void FreeDotnetString(DotnetString value)
     {
-        try { NativeMemory.Free(buffer); }
+        try { DotnetString.Free(value); }
         catch (Exception) { /* No managed exception may cross even this void export. */ }
     }
 
@@ -96,25 +98,10 @@ public static unsafe class NativeEntryPoint
         return owner;
     }
 
-    private static string Read(byte* bytes, int length)
-    {
-        if (bytes == null || length < 0 || length > MaxMessageBytes) throw new ArgumentException("invalid UTF-8 input or message exceeds 8 MiB limit");
-        return Utf8.GetString(new ReadOnlySpan<byte>(bytes, length));
-    }
-
-    private static void Write(byte[] bytes, byte** output, int* length)
-    {
-        if (bytes.Length > MaxMessageBytes) throw new InvalidDataException("response exceeds 8 MiB message limit");
-        var buffer = (byte*)NativeMemory.Alloc((nuint)Math.Max(1, bytes.Length));
-        if (buffer == null) throw new OutOfMemoryException();
-        bytes.CopyTo(new Span<byte>(buffer, bytes.Length));
-        *output = buffer; *length = bytes.Length;
-    }
-
-    private static int Failure(Exception error, byte** output, int* length)
+    private static int Failure(Exception error, DotnetString* output)
     {
         // Flatten exceptions here; never retain config exception/reflection roots.
-        try { Write(Utf8.GetBytes(Diagnostic(error)), output, length); }
+        try { *output = DotnetString.CopyFrom(Diagnostic(error)); }
         catch { return -2; }
         return -1;
     }

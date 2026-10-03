@@ -139,6 +139,7 @@ Test("handler IDs cannot invoke another window's delegate", () =>
 });
 
 Test("native ABI JSON, buffer ownership, size guards and exception containment", () => NativeAbiTests.Run(typeof(ExampleConfig).Assembly.Location, Json(Request("evaluate", window: snapshot))));
+Test("FFI string layout, Unicode, immutable copies and invalid UTF-8", NativeAbiTests.Strings);
 
 Test("config assembly loading shares API identity", () =>
 {

@@ -8,11 +8,48 @@ use std::{
 };
 
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const STRING_ABI_VERSION: u32 = 2;
 
-type Create = extern "system" fn(*const u8, i32, *mut usize, *mut *mut u8, *mut i32) -> i32;
-type Invoke = extern "system" fn(usize, *const u8, i32, *mut *mut u8, *mut i32) -> i32;
-type Destroy = extern "system" fn(usize, *mut *mut u8, *mut i32) -> i32;
-type Free = extern "system" fn(*mut u8);
+/// Immutable UTF-8 borrowed for one synchronous call. Only pass this view while
+/// its source slice is live; managed code must copy before retaining the text.
+#[repr(C)]
+struct RustString {
+    ptr: *const u8,
+    length: i32,
+}
+impl RustString {
+    fn new(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err("request exceeds 8 MiB message limit".into());
+        }
+        Ok(Self {
+            ptr: bytes.as_ptr(),
+            length: bytes.len() as i32,
+        })
+    }
+}
+
+/// Immutable UTF-8 whose ownership is transferred from .NET to Rust. Only the
+/// permanent bootstrap's FreeDotnetString may release it, exactly once.
+/// This raw ABI value is deliberately not Clone/Copy; use OwnedDotnetString.
+#[repr(C)]
+struct DotnetString {
+    ptr: *const u8,
+    length: i32,
+}
+impl DotnetString {
+    fn empty() -> Self {
+        Self {
+            ptr: std::ptr::null(),
+            length: 0,
+        }
+    }
+}
+
+type Create = extern "system" fn(RustString, *mut usize, *mut DotnetString) -> i32;
+type Invoke = extern "system" fn(usize, RustString, *mut DotnetString) -> i32;
+type Destroy = extern "system" fn(usize, *mut DotnetString) -> i32;
+type Free = extern "system" fn(DotnetString);
 
 #[derive(Clone, Copy)]
 struct Bootstrap {
@@ -109,11 +146,16 @@ fn bootstrap(path: &Path) -> Result<Bootstrap, String> {
         let assembly = PdCString::from_os_str(&path).map_err(|e| e.to_string())?;
         let loader = context.get_delegate_loader_for_assembly(assembly).map_err(|e| format!("bootstrap loader: {e}"))?;
         let name = pdcstr!("ShojiWM.Runtime.NativeEntryPoint, ShojiWM.Runtime");
+        // Check before loading/calling changed signatures. A legacy bootstrap
+        // without this export fails safely rather than receiving incompatible arguments.
+        let version = *loader.get_function_with_unmanaged_callers_only::<fn() -> u32>(name, pdcstr!("GetAbiVersion")).map_err(|e| format!("string ABI version export: {e}"))?;
+        let version = version();
+        if version != STRING_ABI_VERSION { return Err(format!("string ABI version mismatch: expected {STRING_ABI_VERSION}, got {version}")); }
         // Signatures exactly match the permanent bootstrap's blittable ABI.
-        let create = *loader.get_function_with_unmanaged_callers_only::<fn(*const u8, i32, *mut usize, *mut *mut u8, *mut i32) -> i32>(name, pdcstr!("CreateHost")).map_err(|e| e.to_string())?;
-        let invoke = *loader.get_function_with_unmanaged_callers_only::<fn(usize, *const u8, i32, *mut *mut u8, *mut i32) -> i32>(name, pdcstr!("Invoke")).map_err(|e| e.to_string())?;
-        let destroy = *loader.get_function_with_unmanaged_callers_only::<fn(usize, *mut *mut u8, *mut i32) -> i32>(name, pdcstr!("DestroyHost")).map_err(|e| e.to_string())?;
-        let free = *loader.get_function_with_unmanaged_callers_only::<fn(*mut u8)>(name, pdcstr!("FreeBuffer")).map_err(|e| e.to_string())?;
+        let create = *loader.get_function_with_unmanaged_callers_only::<fn(RustString, *mut usize, *mut DotnetString) -> i32>(name, pdcstr!("CreateHost")).map_err(|e| e.to_string())?;
+        let invoke = *loader.get_function_with_unmanaged_callers_only::<fn(usize, RustString, *mut DotnetString) -> i32>(name, pdcstr!("Invoke")).map_err(|e| e.to_string())?;
+        let destroy = *loader.get_function_with_unmanaged_callers_only::<fn(usize, *mut DotnetString) -> i32>(name, pdcstr!("DestroyHost")).map_err(|e| e.to_string())?;
+        let free = *loader.get_function_with_unmanaged_callers_only::<fn(DotnetString)>(name, pdcstr!("FreeDotnetString")).map_err(|e| e.to_string())?;
         Ok((path.clone(), Bootstrap { create, invoke, destroy, free }))
     });
     match loaded {
@@ -123,30 +165,41 @@ fn bootstrap(path: &Path) -> Result<Bootstrap, String> {
     }
 }
 
-struct ResponseBuffer {
-    pointer: *mut u8,
-    length: i32,
-    free: Free,
+struct OwnedDotnetString<'a> {
+    value: DotnetString,
+    api: &'a Bootstrap,
 }
-impl ResponseBuffer {
-    fn copy(&self) -> Result<Vec<u8>, String> {
-        if self.length < 0
-            || self.length as usize > MAX_MESSAGE_BYTES
-            || (self.pointer.is_null() && self.length != 0)
+impl<'a> OwnedDotnetString<'a> {
+    fn new(api: &'a Bootstrap) -> Self {
+        Self {
+            value: DotnetString::empty(),
+            api,
+        }
+    }
+
+    // Consume the owner: the foreign allocation is freed immediately after the
+    // copy, including all validation/UTF-8 failure paths. Only Rust-owned bytes escape.
+    fn into_bytes(self) -> Result<Vec<u8>, String> {
+        if self.value.length < 0
+            || self.value.length as usize > MAX_MESSAGE_BYTES
+            || (self.value.ptr.is_null() && self.value.length != 0)
         {
             return Err("invalid native response buffer or message exceeds 8 MiB limit".into());
         }
-        if self.length == 0 {
+        if self.value.length == 0 {
             return Ok(Vec::new());
         }
         // SAFETY: bootstrap owns a readable allocation of length bytes until
-        // FreeBuffer. We copy before the RAII guard releases it.
-        Ok(unsafe { std::slice::from_raw_parts(self.pointer, self.length as usize) }.to_vec())
+        // FreeDotnetString. We copy before the RAII guard releases it.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(self.value.ptr, self.value.length as usize) };
+        std::str::from_utf8(bytes).map_err(|e| format!("invalid DotnetString UTF-8: {e}"))?;
+        Ok(bytes.to_vec())
     }
 }
-impl Drop for ResponseBuffer {
+impl Drop for OwnedDotnetString<'_> {
     fn drop(&mut self) {
-        (self.free)(self.pointer);
+        (self.api.free)(std::mem::replace(&mut self.value, DotnetString::empty()));
     }
 }
 
@@ -161,46 +214,27 @@ impl ManagedHost {
             return Err("config path too long".into());
         }
         let mut handle = 0;
-        let mut output = ResponseBuffer {
-            pointer: std::ptr::null_mut(),
-            length: 0,
-            free: api.free,
-        };
-        let status = (api.create)(
-            bytes.as_ptr(),
-            bytes.len() as i32,
-            &mut handle,
-            &mut output.pointer,
-            &mut output.length,
-        );
+        let mut output = OwnedDotnetString::new(&api);
+        let status = (api.create)(RustString::new(bytes)?, &mut handle, &mut output.value);
+        // Own a successful handle before validating the output, so malformed
+        // output cannot leak the managed host on an early return.
+        let host = (status == 0 && handle != 0).then(|| Self { handle, api });
+        let output = output.into_bytes()?;
         if status != 0 {
             return Err(format!(
                 "managed host creation ({status}): {}",
-                String::from_utf8_lossy(&output.copy()?)
+                String::from_utf8_lossy(&output)
             ));
         }
-        if handle == 0 {
-            return Err("managed bootstrap returned null host handle".into());
-        }
-        Ok(Self { handle, api })
+        host.ok_or_else(|| "managed bootstrap returned null host handle".into())
     }
     fn exchange(&self, bytes: &[u8]) -> Result<Vec<u8>, String> {
         if bytes.len() > MAX_MESSAGE_BYTES {
             return Err("request exceeds 8 MiB message limit".into());
         }
-        let mut output = ResponseBuffer {
-            pointer: std::ptr::null_mut(),
-            length: 0,
-            free: self.api.free,
-        };
-        let status = (self.api.invoke)(
-            self.handle,
-            bytes.as_ptr(),
-            bytes.len() as i32,
-            &mut output.pointer,
-            &mut output.length,
-        );
-        let bytes = output.copy()?;
+        let mut output = OwnedDotnetString::new(&self.api);
+        let status = (self.api.invoke)(self.handle, RustString::new(bytes)?, &mut output.value);
+        let bytes = output.into_bytes()?;
         if status != 0 {
             return Err(format!(
                 "managed ABI invocation ({status}): {}",
@@ -212,17 +246,13 @@ impl ManagedHost {
 }
 impl Drop for ManagedHost {
     fn drop(&mut self) {
-        let mut output = ResponseBuffer {
-            pointer: std::ptr::null_mut(),
-            length: 0,
-            free: self.api.free,
-        };
-        let status = (self.api.destroy)(self.handle, &mut output.pointer, &mut output.length);
+        let mut output = OwnedDotnetString::new(&self.api);
+        let status = (self.api.destroy)(self.handle, &mut output.value);
         if status != 0 {
             eprintln!(
                 "ShojiWM .NET host disposal ({status}): {:?}",
                 output
-                    .copy()
+                    .into_bytes()
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
             );
         }
@@ -303,6 +333,87 @@ impl Drop for InProcessDotNetHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_abi_layout_and_borrowed_bytes() {
+        let size = if std::mem::size_of::<usize>() == 8 {
+            16
+        } else {
+            8
+        };
+        assert_eq!(std::mem::size_of::<RustString>(), size);
+        assert_eq!(std::mem::size_of::<DotnetString>(), size);
+        assert_eq!(std::mem::offset_of!(RustString, ptr), 0);
+        assert_eq!(std::mem::offset_of!(DotnetString, ptr), 0);
+        assert_eq!(
+            std::mem::offset_of!(RustString, length),
+            std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(DotnetString, length),
+            std::mem::size_of::<usize>()
+        );
+        let text = "日本語🙂\0末尾";
+        let borrowed = RustString::new(text.as_bytes()).unwrap();
+        assert_eq!(borrowed.ptr, text.as_ptr());
+        assert_eq!(borrowed.length as usize, text.len());
+        assert_eq!(RustString::new(&[]).unwrap().length, 0);
+        assert!(RustString::new(&vec![0; MAX_MESSAGE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn owned_dotnet_string_frees_once_on_copy_validation_error_and_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn free(value: DotnetString) {
+            FREED.fetch_add(1, Ordering::SeqCst);
+            if !value.ptr.is_null() {
+                // Test allocations are one Box<u8>, independently of the ABI length.
+                unsafe {
+                    drop(Box::from_raw(value.ptr as *mut u8));
+                }
+            }
+        }
+        extern "system" fn create(_: RustString, _: *mut usize, _: *mut DotnetString) -> i32 {
+            0
+        }
+        extern "system" fn invoke(_: usize, _: RustString, _: *mut DotnetString) -> i32 {
+            0
+        }
+        extern "system" fn destroy(_: usize, _: *mut DotnetString) -> i32 {
+            0
+        }
+        let api = Bootstrap {
+            create,
+            invoke,
+            destroy,
+            free,
+        };
+        let cases = [
+            (Some(b'x'), 1, true),
+            (None, 0, true),
+            (Some(b'x'), 0, true),
+            (None, 1, false),
+            (Some(b'x'), -1, false),
+            (Some(b'x'), MAX_MESSAGE_BYTES as i32 + 1, false),
+            (Some(0xff), 1, false),
+        ];
+        for (index, (byte, length, success)) in cases.into_iter().enumerate() {
+            let mut owned = OwnedDotnetString::new(&api);
+            owned.value = DotnetString {
+                ptr: byte.map_or(std::ptr::null(), |byte| Box::into_raw(Box::new(byte))),
+                length,
+            };
+            let copied = owned.into_bytes();
+            assert_eq!(FREED.load(Ordering::SeqCst), index + 1);
+            assert_eq!(copied.is_ok(), success);
+            if length == 1 && success {
+                assert_eq!(copied.unwrap(), b"x");
+            }
+        }
+        drop(OwnedDotnetString::new(&api));
+        assert_eq!(FREED.load(Ordering::SeqCst), cases.len() + 1);
+    }
 
     #[test]
     fn old_dotted_apphost_name_resolves_bootstrap_not_public_api() {
