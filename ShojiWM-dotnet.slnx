@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/tools/">
+    <Project Path="tools/ShojiWM.Tools.csproj" />
+  </Folder>
   <Folder Name="/dotnet/">
     <Project Path="dotnet/ShojiWM.Example/ShojiWM.Example.csproj" />
     <Project Path="dotnet/ShojiWM.Runtime/ShojiWM.Runtime.csproj" />

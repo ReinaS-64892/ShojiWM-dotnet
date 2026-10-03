@@ -1,10 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <ProjectReference Include="../../tools/ShojiWM.Tools.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
     <!-- Include explicitly so a clean checkout can generate it after evaluation. -->
     <Compile Remove="Generated/Protocol.g.cs" />
     <Compile Include="Generated/Protocol.g.cs" />
   </ItemGroup>
   <Target Name="GenerateProtocolBindings" BeforeTargets="BeforeCompile">
-    <Exec Command="python3 &quot;$(MSBuildThisFileDirectory)../../tools/generate-dotnet-bindings.py&quot;" />
+    <Exec Command="dotnet &quot;$(MSBuildThisFileDirectory)../../tools/bin/$(Configuration)/net10.0/ShojiWM.Tools.dll&quot; generate" />
   </Target>
 </Project>
