@@ -24,12 +24,8 @@ public static unsafe partial class NativeEntryPoint
         try {
             if (host is not null) return AbiConvert.FailureStatus(NativeFailureStatus.HostError, "host already initialized");
             var loaded = new ConfigurationHost(AbiConvert.ReadString(path));
-            // Allocate the acknowledgement before publishing ownership.
-            SwmStatusResult ack;
-            try { ack = AbiConvert.WriteAck(); }
-            catch { loaded.Dispose(); throw; }
             host = loaded; ownerThreadId = Environment.CurrentManagedThreadId;
-            return ack;
+            return AbiConvert.WriteAck();
         } catch (Exception e) { return AbiConvert.FailureStatus(e, NativeFailureStatus.HostError); }
         finally { Exit(); }
     }

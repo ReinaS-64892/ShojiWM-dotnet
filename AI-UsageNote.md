@@ -56,6 +56,9 @@ status は 0=成功、1=設定/runtime semantic failure、2=host failure、4=inv
 managed 側の分類は `NativeFailureStatus` enum で扱い、ABI の `Status` は `int` に変換します。
 各 export は一つの例外境界で `Exception.ToString()` を返します。診断は最大4096文字です。
 診断 arena も構築できない failure は元の status と NULL arena を返します。
+payload を返さない `SwmStatusResult` の成功は `status=0, arena={NULL,0}, error=NULL`
+です。managed/native の allocation はなく、Rust はこの正規形で `SWMArenaFree` を呼びません。
+payload を持つ成功と error arena は従来どおり検証・decode 後に一回 free します。
 Rust は診断が取得できなかった旨を補い、元の分類を保持します。
 semantic failure は host を停止せず、host/ABI failure は従来どおり restart required として扱います。
 入力・結果 arena は最大 8 MiB、浮動小数点の NaN/Infinity は拒否します。native graph は最大 depth 64、managed composition は

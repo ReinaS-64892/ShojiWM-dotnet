@@ -119,6 +119,7 @@ Test("handler IDs cannot invoke another window's delegate", () =>
 
 Test("native arena ABI, ownership, size guards and exception containment", () => NativeAbiTests.Run(typeof(ExampleConfig).Assembly.Location, Evaluate(snapshot)));
 Test("arena layout, Unicode, alignment and allocation failure", ArenaTests.Basics);
+Test("payload-free success allocates no managed or native memory", ArenaTests.AllocationFreeAck);
 Test("native graphs: wide/deep trees, actions, optional values and unsupported data", ArenaTests.Graphs);
 
 Test("config assembly loading shares API identity", () =>

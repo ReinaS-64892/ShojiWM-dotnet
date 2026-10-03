@@ -241,6 +241,14 @@ impl<T: DecodePayload> NativeResult<T> {
 }
 impl SwmStatusResult {
     pub fn decode(self, free: ArenaFree) -> Result<(), BridgeError> {
+        // Only a payload-free success may omit its arena. It owns no allocation,
+        // so it must not call the managed free export, even with a NULL argument.
+        if self.status == 0 && self.arena.ptr.is_null() && self.arena.length == 0 {
+            if !self.error.is_null() {
+                return Err(BridgeError::Host("success contains an error".into()));
+            }
+            return Ok(());
+        }
         let _owner = OwnedManagedArena {
             arena: self.arena,
             free,
@@ -385,6 +393,69 @@ mod tests {
         mem::{align_of, offset_of, size_of},
         sync::atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn empty_ack_needs_no_free_and_does_not_relax_payload_validation() {
+        static FREES: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn free(_: ResultArena) {
+            FREES.fetch_add(1, Ordering::SeqCst);
+        }
+        let empty = ResultArena {
+            ptr: std::ptr::null(),
+            length: 0,
+        };
+        for _ in 0..1000 {
+            SwmStatusResult {
+                status: 0,
+                arena: empty,
+                error: std::ptr::null(),
+            }
+            .decode(free)
+            .unwrap();
+        }
+        assert_eq!(FREES.load(Ordering::SeqCst), 0);
+        assert!(
+            SwmStatusResult {
+                status: 0,
+                arena: empty,
+                error: std::ptr::dangling(),
+            }
+            .decode(free)
+            .is_err()
+        );
+        assert_eq!(FREES.load(Ordering::SeqCst), 0);
+        assert!(
+            SwmStatusResult {
+                status: 0,
+                arena: ResultArena { length: 1, ..empty },
+                error: std::ptr::null(),
+            }
+            .decode(free)
+            .is_err()
+        );
+        // Payload-bearing successes still require a valid arena and root.
+        assert!(
+            SwmEvaluateResult {
+                status: 0,
+                arena: empty,
+                value: std::ptr::null(),
+                error: std::ptr::null(),
+            }
+            .decode(free)
+            .is_err()
+        );
+        // The existing error cleanup path, including NULL failure arenas, remains.
+        assert!(matches!(
+            SwmStatusResult {
+                status: 1,
+                arena: empty,
+                error: std::ptr::null(),
+            }
+            .decode(free),
+            Err(BridgeError::Semantic(_))
+        ));
+        assert_eq!(FREES.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn operation_layouts() {

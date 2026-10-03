@@ -24,11 +24,7 @@ public static unsafe partial class AbiConvert
         try { return FailureStatus(status, error.ToString()); }
         catch { return FailureStatus(status, "exception diagnostic could not be formatted"); }
     }
-    internal static SwmStatusResult WriteAck()
-    {
-        using var writer = new ArenaWriter(1); writer.Put((byte)0);
-        return new() { Arena = writer.Finish() };
-    }
+    internal static SwmStatusResult WriteAck() => default;
     internal static SwmStatusResult FailureStatus(NativeFailureStatus status, string message)
     {
         try {

@@ -140,7 +140,23 @@ internal static unsafe class ArenaTests
         var commit = AbiConvert.WriteCommitAssembly(new(null));
         try { Check(commit.Value->DebugConfig == null); } finally { free(commit.Arena); }
         var ack = AbiConvert.WriteAck();
-        try { Check(ack.Status == 0 && ack.Arena.Ptr != null && ack.Error == null); } finally { free(ack.Arena); }
+        Check(ack.Status == 0 && ack.Arena.Ptr == null && ack.Arena.Length == 0 && ack.Error == null);
+    }
+    public static void AllocationFreeAck()
+    {
+        _ = AbiConvert.WriteAck(); // Warm the method before measuring.
+        long nativeAllocations = ArenaWriter.AllocationCount;
+        long nativeBytes = ArenaWriter.AllocatedBytes;
+        long managedBytes = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1000; i++) {
+            var ack = AbiConvert.WriteAck();
+            Check(ack.Status == 0 && ack.Arena.Ptr == null && ack.Arena.Length == 0 && ack.Error == null);
+        }
+        Check(GC.GetAllocatedBytesForCurrentThread() == managedBytes);
+        Check(ArenaWriter.AllocationCount == nativeAllocations && ArenaWriter.AllocatedBytes == nativeBytes);
+        ArenaWriter.FailAllocationForTest = true;
+        try { Check(AbiConvert.WriteAck().Status == 0); }
+        finally { ArenaWriter.FailAllocationForTest = false; }
     }
     public static void Differential(EvaluateRequest request, EvaluationResult legacy)
     {
