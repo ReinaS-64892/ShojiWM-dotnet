@@ -539,8 +539,10 @@ mod tests {
 
     #[test]
     fn shared_snapshot_fixture_matches_actual_rust_wire() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../dotnet/fixtures/window.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../dotnet/ShojiWM.Tests/Fixtures/window.json"
+        ))
+        .unwrap();
         assert_eq!(serde_json::to_value(snapshot()).unwrap(), fixture);
     }
 

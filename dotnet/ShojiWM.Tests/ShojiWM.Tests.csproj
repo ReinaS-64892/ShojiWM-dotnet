@@ -3,6 +3,6 @@
   <ItemGroup>
     <ProjectReference Include="../ShojiWM.Runtime/ShojiWM.Runtime.csproj" />
     <ProjectReference Include="../ShojiWM.Example/ShojiWM.Example.csproj" />
-    <None Include="../fixtures/window.json" Link="window.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Fixtures/window.json" TargetPath="window.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

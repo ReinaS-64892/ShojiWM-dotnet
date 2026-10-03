@@ -15,7 +15,8 @@ fn request(
     config: Option<&PathBuf>,
     handler: Option<&str>,
 ) -> Value {
-    let snapshot: Value = serde_json::from_str(include_str!("../fixtures/window.json")).unwrap();
+    let snapshot: Value =
+        serde_json::from_str(include_str!("../ShojiWM.Tests/Fixtures/window.json")).unwrap();
     let bytes = serde_json::to_vec(&json!({"kind":kind, "requestId":id, "nowMs":1234,
         "displayState":{}, "inputState":{}, "snapshot":snapshot, "windowId":"1",
         "configPath":config, "handlerId":handler, "reason":"initial"}))
@@ -110,7 +111,8 @@ fn main() {
     // Size guards replace pipe-line limits, including oversized managed output.
     settings(&"x".repeat(host::MAX_MESSAGE_BYTES + 1), "");
     assert!(request(&host, "prepareAssembly", 16, Some(&fixture), None)["ok"] == true);
-    let snapshot: Value = serde_json::from_str(include_str!("../fixtures/window.json")).unwrap();
+    let snapshot: Value =
+        serde_json::from_str(include_str!("../ShojiWM.Tests/Fixtures/window.json")).unwrap();
     let preview = serde_json::to_vec(&json!({"kind":"evaluateCandidatePreview","requestId":17,"snapshot":snapshot,"windowId":"1","nowMs":0,"displayState":{},"inputState":{}})).unwrap();
     let oversized: Value =
         serde_json::from_slice(&host.lock().unwrap().exchange(preview).unwrap()).unwrap();
