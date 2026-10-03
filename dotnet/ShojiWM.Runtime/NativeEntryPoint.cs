@@ -4,83 +4,81 @@ using ShojiWM.Wire;
 
 namespace ShojiWM.Runtime;
 
-/// Permanent bootstrap exports. All calls for a handle belong to its creating
-/// OS thread. RustString inputs are borrowed for the call; DotnetString outputs
-/// transfer ownership to Rust and must use FreeDotnetString, even on failure.
+/// Permanent bootstrap exports for a single compositor-owned host. Initialize
+/// and Shutdown bracket its lifetime; reload only replaces configuration ALCs.
+/// RustString inputs are borrowed; all result strings use FreeDotnetString.
 public static unsafe class NativeEntryPoint
 {
     public const int MaxMessageBytes = 8 * 1024 * 1024;
-    public const uint AbiVersion = 2;
+    public const uint AbiVersion = 3;
+
+    private static ConfigurationHost? host;
+    private static int ownerThreadId;
+    private static int inCall;
 
     [UnmanagedCallersOnly]
     public static uint GetAbiVersion() => AbiVersion;
-    private sealed class HostOwner(string path)
-    {
-        public readonly ConfigurationHost Host = new(path);
-        public readonly int ThreadId = Environment.CurrentManagedThreadId;
-    }
 
     [UnmanagedCallersOnly]
-    public static int CreateHost(RustString path, nint* handle, DotnetString* error)
+    public static NativeResult Initialize(RustString path)
     {
-        if (handle != null) *handle = 0;
-        if (error != null) *error = default;
-        if (handle == null || error == null) return -1;
+        if (!TryEnter()) return Busy();
         try
         {
-            var owner = new HostOwner(path.ToManagedString());
-            try { *handle = GCHandle.ToIntPtr(GCHandle.Alloc(owner)); }
-            catch { owner.Host.Dispose(); throw; }
-            return 0;
+            if (host is not null) throw new InvalidOperationException("host already initialized");
+            // Publish only after a successful load; failure permits a later retry.
+            host = new ConfigurationHost(path.ToManagedString());
+            ownerThreadId = Environment.CurrentManagedThreadId;
+            return Success();
         }
-        catch (Exception exception) { return Failure(exception, error); }
+        catch (Exception exception) { return Failure(exception); }
+        finally { Exit(); }
     }
 
     [UnmanagedCallersOnly]
-    public static int Invoke(nint handle, RustString request, DotnetString* response)
+    public static NativeResult Invoke(RustString request)
     {
-        if (response == null) return -1;
-        *response = default;
+        if (!TryEnter()) return Busy();
         try
         {
-            var host = Owner(handle).Host;
+            var current = CurrentHost();
             var json = request.ToManagedString();
             try
             {
-                var result = host.HandleJson(json);
-                *response = DotnetString.CopyFromUtf8(JsonSerializer.SerializeToUtf8Bytes(result, WireJson.Options));
+                var result = current.HandleJson(json);
+                return Success(DotnetString.CopyFromUtf8(JsonSerializer.SerializeToUtf8Bytes(result, WireJson.Options)));
             }
             catch (Exception exception)
             {
-                // Serialization/size errors are semantic rejection, too. A
-                // candidate with excessive output must not disable the host
-                // or prevent Rust from aborting it and retaining active config.
+                // Excessive output rejects a candidate without disabling the host.
                 ulong id = 0;
                 var kind = "protocolError";
                 using var document = JsonDocument.Parse(json);
                 if (document.RootElement.TryGetProperty("requestId", out var value)) value.TryGetUInt64(out id);
                 if (document.RootElement.TryGetProperty("kind", out value) && value.ValueKind == JsonValueKind.String) kind = value.GetString()!;
                 var failure = new ExternalRuntimeResponse { RequestId = id, Kind = kind, Ok = false, Error = Diagnostic(exception), Actions = [] };
-                *response = DotnetString.CopyFromUtf8(JsonSerializer.SerializeToUtf8Bytes(failure, WireJson.Options));
+                return Success(DotnetString.CopyFromUtf8(JsonSerializer.SerializeToUtf8Bytes(failure, WireJson.Options)));
             }
-            return 0;
         }
-        catch (Exception exception) { return Failure(exception, response); }
+        catch (Exception exception) { return Failure(exception); }
+        finally { Exit(); }
     }
 
     [UnmanagedCallersOnly]
-    public static int DestroyHost(nint handle, DotnetString* error)
+    public static NativeResult Shutdown()
     {
-        if (error == null) return -1;
-        *error = default;
+        if (!TryEnter()) return Busy();
         try
         {
-            var owner = Owner(handle);
-            try { owner.Host.Dispose(); }
-            finally { GCHandle.FromIntPtr(handle).Free(); }
-            return 0;
+            if (host is null) return Success(); // Idempotent after shutdown or a failed initialization.
+            var current = CurrentHost();
+            host = null;
+            ownerThreadId = 0;
+            current.Dispose();
+            return Success();
         }
-        catch (Exception exception) { return Failure(exception, error); }
+        catch (Exception exception) { return Failure(exception); }
+        finally { Exit(); }
     }
 
     [UnmanagedCallersOnly]
@@ -90,20 +88,29 @@ public static unsafe class NativeEntryPoint
         catch (Exception) { /* No managed exception may cross even this void export. */ }
     }
 
-    private static HostOwner Owner(nint handle)
+    // Reject concurrent and reentrant calls rather than waiting inside the FFI.
+    // The successful entrant alone owns all accesses to host and ownerThreadId.
+    private static bool TryEnter() => Interlocked.CompareExchange(ref inCall, 1, 0) == 0;
+    private static void Exit() => Volatile.Write(ref inCall, 0);
+    private static NativeResult Busy()
     {
-        if (handle == 0) throw new ArgumentException("null host handle");
-        var owner = (HostOwner)(GCHandle.FromIntPtr(handle).Target ?? throw new ObjectDisposedException("host"));
-        if (owner.ThreadId != Environment.CurrentManagedThreadId) throw new InvalidOperationException("host called from a different thread");
-        return owner;
+        try { return new(NativeStatus.Failure, DotnetString.CopyFrom("concurrent or reentrant host call")); }
+        catch { return new(NativeStatus.AllocationFailure, default); }
     }
 
-    private static int Failure(Exception error, DotnetString* output)
+    private static ConfigurationHost CurrentHost()
     {
-        // Flatten exceptions here; never retain config exception/reflection roots.
-        try { *output = DotnetString.CopyFrom(Diagnostic(error)); }
-        catch { return -2; }
-        return -1;
+        var current = host ?? throw new InvalidOperationException("host is not initialized");
+        if (ownerThreadId != Environment.CurrentManagedThreadId) throw new InvalidOperationException("host called from a different thread");
+        return current;
+    }
+
+    private static NativeResult Success(DotnetString response = default) => new(NativeStatus.Success, response);
+    private static NativeResult Failure(Exception error)
+    {
+        // Flatten exceptions; never retain config exception/reflection roots.
+        try { return new(NativeStatus.Failure, DotnetString.CopyFrom(Diagnostic(error))); }
+        catch { return new(NativeStatus.AllocationFailure, default); }
     }
 
     private static string Diagnostic(Exception error)

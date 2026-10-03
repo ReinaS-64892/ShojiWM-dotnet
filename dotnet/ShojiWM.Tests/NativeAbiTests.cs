@@ -12,6 +12,9 @@ internal static unsafe class NativeAbiTests
         delegate* unmanaged<DotnetString, void> free = &NativeEntryPoint.FreeDotnetString;
         int size = IntPtr.Size == 8 ? 16 : 8;
         Check(sizeof(RustString) == size && sizeof(DotnetString) == size);
+        Check(sizeof(NativeStatus) == 4 && sizeof(NativeResult) == (IntPtr.Size == 8 ? 24 : 12));
+        Check(Marshal.OffsetOf<NativeResult>(nameof(NativeResult.Status)) == 0);
+        Check(Marshal.OffsetOf<NativeResult>(nameof(NativeResult.Response)) == IntPtr.Size);
         Check(Marshal.OffsetOf<RustString>(nameof(RustString.Ptr)) == 0);
         Check(Marshal.OffsetOf<DotnetString>(nameof(DotnetString.Ptr)) == 0);
         Check(Marshal.OffsetOf<RustString>(nameof(RustString.Length)) == IntPtr.Size);
@@ -62,54 +65,68 @@ internal static unsafe class NativeAbiTests
         throw new InvalidOperationException("invalid string accepted");
     }
 
+    private static string ReadAndFree(NativeResult result)
+    {
+        delegate* unmanaged<DotnetString, void> free = &NativeEntryPoint.FreeDotnetString;
+        try { return new RustString(result.Response.Ptr, result.Response.Length).ToManagedString(); }
+        finally { free(result.Response); }
+    }
+
+    private static string AssertResult(NativeResult result, NativeStatus status)
+    {
+        string response = ReadAndFree(result);
+        Check(result.Status == status);
+        return response;
+    }
+
     public static void Run(string config, string request)
     {
         delegate* unmanaged<uint> version = &NativeEntryPoint.GetAbiVersion;
-        delegate* unmanaged<RustString, nint*, DotnetString*, int> create = &NativeEntryPoint.CreateHost;
-        delegate* unmanaged<nint, RustString, DotnetString*, int> invoke = &NativeEntryPoint.Invoke;
-        delegate* unmanaged<nint, DotnetString*, int> destroy = &NativeEntryPoint.DestroyHost;
-        delegate* unmanaged<DotnetString, void> free = &NativeEntryPoint.FreeDotnetString;
+        delegate* unmanaged<RustString, NativeResult> initialize = &NativeEntryPoint.Initialize;
+        delegate* unmanaged<RustString, NativeResult> invoke = &NativeEntryPoint.Invoke;
+        delegate* unmanaged<NativeResult> shutdown = &NativeEntryPoint.Shutdown;
         Check(version() == NativeEntryPoint.AbiVersion);
+        AssertResult(invoke(default), NativeStatus.Failure);
+        AssertResult(shutdown(), NativeStatus.Success);
         var path = Encoding.UTF8.GetBytes(config);
-        nint handle = 0;
-        DotnetString response = default;
-        fixed (byte* input = path) Check(create(new(input, path.Length), &handle, &response) == 0 && handle != 0 && response.Ptr == null);
+        fixed (byte* input = path)
+        {
+            AssertResult(initialize(new(input, NativeEntryPoint.MaxMessageBytes + 1)), NativeStatus.Failure);
+            AssertResult(initialize(new(input, -1)), NativeStatus.Failure);
+            AssertResult(initialize(new(null, 1)), NativeStatus.Failure);
+            AssertResult(initialize(new(input, path.Length)), NativeStatus.Success);
+        }
         try
         {
+            fixed (byte* input = path)
+                Check(AssertResult(initialize(new(input, path.Length)), NativeStatus.Failure).Contains("already initialized"));
+            // Rejected calls from another thread must leave the original host usable.
+            Task.Run(() =>
+            {
+                delegate* unmanaged<RustString, NativeResult> call = &NativeEntryPoint.Invoke;
+                delegate* unmanaged<NativeResult> stop = &NativeEntryPoint.Shutdown;
+                Check(AssertResult(call(default), NativeStatus.Failure).Contains("different thread"));
+                Check(AssertResult(stop(), NativeStatus.Failure).Contains("different thread"));
+            }).GetAwaiter().GetResult();
             var json = Encoding.UTF8.GetBytes(request);
             fixed (byte* input = json)
             {
-                Check(invoke(handle, new(input, json.Length), &response) == 0);
-                string copied;
-                try { copied = new RustString(response.Ptr, response.Length).ToManagedString(); }
-                finally { free(response); }
-                using var document = JsonDocument.Parse(copied); // No dependency on the freed allocation.
+                string copied = AssertResult(invoke(new(input, json.Length)), NativeStatus.Success);
+                using var document = JsonDocument.Parse(copied); // Foreign response already freed.
                 Check(document.RootElement.GetProperty("requestId").GetUInt64() == 42);
                 Check(document.RootElement.GetProperty("ok").GetBoolean());
-                Check(invoke(handle, new(input, NativeEntryPoint.MaxMessageBytes + 1), &response) != 0);
-                free(response);
-                Check(invoke(handle, new(input, -1), &response) != 0);
-                free(response);
+                AssertResult(invoke(new(input, NativeEntryPoint.MaxMessageBytes + 1)), NativeStatus.Failure);
+                AssertResult(invoke(new(input, -1)), NativeStatus.Failure);
             }
             var invalid = new byte[] { 0xff };
-            fixed (byte* input = invalid)
-            {
-                Check(invoke(handle, new(input, 1), &response) != 0);
-                free(response);
-            }
-            Check(invoke(handle, new(null, 1), &response) != 0);
-            free(response);
-            Check(invoke(0, default, &response) != 0);
-            free(response);
-            Check(invoke(handle, default, null) != 0);
+            fixed (byte* input = invalid) AssertResult(invoke(new(input, 1)), NativeStatus.Failure);
+            AssertResult(invoke(new(null, 1)), NativeStatus.Failure);
         }
-        finally { Check(destroy(handle, &response) == 0); free(response); }
-        fixed (byte* input = path)
-        {
-            Check(create(new(input, NativeEntryPoint.MaxMessageBytes + 1), &handle, &response) != 0 && handle == 0);
-            free(response);
-            Check(create(new(input, path.Length), null, &response) != 0);
-        }
-        free(default);
+        finally { AssertResult(shutdown(), NativeStatus.Success); }
+        AssertResult(invoke(default), NativeStatus.Failure);
+        AssertResult(shutdown(), NativeStatus.Success);
+        // Sequential compositor/test lifetimes can initialize after a clean shutdown.
+        fixed (byte* input = path) AssertResult(initialize(new(input, path.Length)), NativeStatus.Success);
+        AssertResult(shutdown(), NativeStatus.Success);
     }
 }

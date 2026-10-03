@@ -2,13 +2,15 @@
 //! boundary. Config objects stay managed; all calls for a host run on one thread.
 use netcorehost::{hostfxr::Hostfxr, pdcstr, pdcstring::PdCString};
 use std::{
+    marker::PhantomData,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{OnceLock, mpsc},
     thread::{self, JoinHandle},
 };
 
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
-const STRING_ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 
 /// Immutable UTF-8 borrowed for one synchronous call. Only pass this view while
 /// its source slice is live; managed code must copy before retaining the text.
@@ -46,16 +48,57 @@ impl DotnetString {
     }
 }
 
-type Create = extern "system" fn(RustString, *mut usize, *mut DotnetString) -> i32;
-type Invoke = extern "system" fn(usize, RustString, *mut DotnetString) -> i32;
-type Destroy = extern "system" fn(usize, *mut DotnetString) -> i32;
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeStatus {
+    Success = 0,
+    Failure = 1,
+    AllocationFailure = 2,
+}
+
+/// Status plus an owned response, returned by value. Keep the status as raw i32
+/// at the foreign boundary so an unknown discriminant is an error, never Rust UB.
+#[repr(C)]
+struct NativeResult {
+    status: i32,
+    response: DotnetString,
+}
+impl NativeResult {
+    fn into_bytes(self, api: &Bootstrap, operation: &str) -> Result<Vec<u8>, String> {
+        let response = OwnedDotnetString {
+            value: self.response,
+            api,
+        }
+        .into_bytes()?;
+        match self.status {
+            status if status == NativeStatus::Success as i32 => Ok(response),
+            status => {
+                let status = match status {
+                    status if status == NativeStatus::Failure as i32 => "failure".to_owned(),
+                    status if status == NativeStatus::AllocationFailure as i32 => {
+                        "allocation failure".to_owned()
+                    }
+                    status => format!("unknown status {status}"),
+                };
+                Err(format!(
+                    "managed {operation} ({status}): {}",
+                    String::from_utf8_lossy(&response)
+                ))
+            }
+        }
+    }
+}
+
+type Initialize = extern "system" fn(RustString) -> NativeResult;
+type Invoke = extern "system" fn(RustString) -> NativeResult;
+type Shutdown = extern "system" fn() -> NativeResult;
 type Free = extern "system" fn(DotnetString);
 
 #[derive(Clone, Copy)]
 struct Bootstrap {
-    create: Create,
+    initialize: Initialize,
     invoke: Invoke,
-    destroy: Destroy,
+    shutdown: Shutdown,
     free: Free,
 }
 static BOOTSTRAP: OnceLock<Result<(PathBuf, Bootstrap), String>> = OnceLock::new();
@@ -136,27 +179,68 @@ fn bootstrap(path: &Path) -> Result<Bootstrap, String> {
     let path = component_path(path)?;
     let loaded = BOOTSTRAP.get_or_init(|| {
         let runtimeconfig = path.with_extension("runtimeconfig.json");
-        if !runtimeconfig.is_file() { return Err(format!("missing {}", runtimeconfig.display())); }
+        if !runtimeconfig.is_file() {
+            return Err(format!("missing {}", runtimeconfig.display()));
+        }
         // Intentionally process lifetime: retain the library even if initialization
         // fails after it has loaded. Context close is not CLR shutdown/dlclose.
-        let library = Hostfxr::load_from_path(find_hostfxr()?).map_err(|e| format!("hostfxr load: {e}"))?;
+        let library =
+            Hostfxr::load_from_path(find_hostfxr()?).map_err(|e| format!("hostfxr load: {e}"))?;
         let library = Box::leak(Box::new(library));
         let config = PdCString::from_os_str(&runtimeconfig).map_err(|e| e.to_string())?;
-        let context = library.initialize_for_runtime_config(config).map_err(|e| format!("CoreCLR initialization: {e}"))?;
+        let context = library
+            .initialize_for_runtime_config(config)
+            .map_err(|e| format!("CoreCLR initialization: {e}"))?;
         let assembly = PdCString::from_os_str(&path).map_err(|e| e.to_string())?;
-        let loader = context.get_delegate_loader_for_assembly(assembly).map_err(|e| format!("bootstrap loader: {e}"))?;
+        let loader = context
+            .get_delegate_loader_for_assembly(assembly)
+            .map_err(|e| format!("bootstrap loader: {e}"))?;
         let name = pdcstr!("ShojiWM.Runtime.NativeEntryPoint, ShojiWM.Runtime");
         // Check before loading/calling changed signatures. A legacy bootstrap
         // without this export fails safely rather than receiving incompatible arguments.
-        let version = *loader.get_function_with_unmanaged_callers_only::<fn() -> u32>(name, pdcstr!("GetAbiVersion")).map_err(|e| format!("string ABI version export: {e}"))?;
+        let version = *loader
+            .get_function_with_unmanaged_callers_only::<fn() -> u32>(name, pdcstr!("GetAbiVersion"))
+            .map_err(|e| format!("ABI version export: {e}"))?;
         let version = version();
-        if version != STRING_ABI_VERSION { return Err(format!("string ABI version mismatch: expected {STRING_ABI_VERSION}, got {version}")); }
+        if version != ABI_VERSION {
+            return Err(format!(
+                "ABI version mismatch: expected {ABI_VERSION}, got {version}"
+            ));
+        }
         // Signatures exactly match the permanent bootstrap's blittable ABI.
-        let create = *loader.get_function_with_unmanaged_callers_only::<fn(RustString, *mut usize, *mut DotnetString) -> i32>(name, pdcstr!("CreateHost")).map_err(|e| e.to_string())?;
-        let invoke = *loader.get_function_with_unmanaged_callers_only::<fn(usize, RustString, *mut DotnetString) -> i32>(name, pdcstr!("Invoke")).map_err(|e| e.to_string())?;
-        let destroy = *loader.get_function_with_unmanaged_callers_only::<fn(usize, *mut DotnetString) -> i32>(name, pdcstr!("DestroyHost")).map_err(|e| e.to_string())?;
-        let free = *loader.get_function_with_unmanaged_callers_only::<fn(DotnetString)>(name, pdcstr!("FreeDotnetString")).map_err(|e| e.to_string())?;
-        Ok((path.clone(), Bootstrap { create, invoke, destroy, free }))
+        let initialize = *loader
+            .get_function_with_unmanaged_callers_only::<fn(RustString) -> NativeResult>(
+                name,
+                pdcstr!("Initialize"),
+            )
+            .map_err(|e| e.to_string())?;
+        let invoke = *loader
+            .get_function_with_unmanaged_callers_only::<fn(RustString) -> NativeResult>(
+                name,
+                pdcstr!("Invoke"),
+            )
+            .map_err(|e| e.to_string())?;
+        let shutdown = *loader
+            .get_function_with_unmanaged_callers_only::<fn() -> NativeResult>(
+                name,
+                pdcstr!("Shutdown"),
+            )
+            .map_err(|e| e.to_string())?;
+        let free = *loader
+            .get_function_with_unmanaged_callers_only::<fn(DotnetString)>(
+                name,
+                pdcstr!("FreeDotnetString"),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((
+            path.clone(),
+            Bootstrap {
+                initialize,
+                invoke,
+                shutdown,
+                free,
+            },
+        ))
     });
     match loaded {
         Ok((active, api)) if active == &path => Ok(*api),
@@ -170,6 +254,7 @@ struct OwnedDotnetString<'a> {
     api: &'a Bootstrap,
 }
 impl<'a> OwnedDotnetString<'a> {
+    #[cfg(test)]
     fn new(api: &'a Bootstrap) -> Self {
         Self {
             value: DotnetString::empty(),
@@ -204,57 +289,38 @@ impl Drop for OwnedDotnetString<'_> {
 }
 
 struct ManagedHost {
-    handle: usize,
     api: Bootstrap,
+    // A unique lifetime token, confined to the initializing thread. It is neither
+    // Clone nor Send/Sync; dropping it shuts down the single static managed host.
+    owner_thread: PhantomData<Rc<()>>,
 }
 impl ManagedHost {
-    fn create(api: Bootstrap, path: &Path) -> Result<Self, String> {
+    fn initialize(api: Bootstrap, path: &Path) -> Result<Self, String> {
         let bytes = path.to_str().ok_or("config path must be UTF-8")?.as_bytes();
         if bytes.len() > MAX_MESSAGE_BYTES {
             return Err("config path too long".into());
         }
-        let mut handle = 0;
-        let mut output = OwnedDotnetString::new(&api);
-        let status = (api.create)(RustString::new(bytes)?, &mut handle, &mut output.value);
-        // Own a successful handle before validating the output, so malformed
-        // output cannot leak the managed host on an early return.
-        let host = (status == 0 && handle != 0).then(|| Self { handle, api });
-        let output = output.into_bytes()?;
-        if status != 0 {
-            return Err(format!(
-                "managed host creation ({status}): {}",
-                String::from_utf8_lossy(&output)
-            ));
-        }
-        host.ok_or_else(|| "managed bootstrap returned null host handle".into())
+        let result = (api.initialize)(RustString::new(bytes)?);
+        // Own successful initialization before validating its response, so an
+        // early error drops the token and releases the static managed host.
+        let host = (result.status == NativeStatus::Success as i32).then(|| Self {
+            api,
+            owner_thread: PhantomData,
+        });
+        result.into_bytes(&api, "initialization")?;
+        host.ok_or_else(|| "managed initialization did not establish ownership".into())
     }
     fn exchange(&self, bytes: &[u8]) -> Result<Vec<u8>, String> {
         if bytes.len() > MAX_MESSAGE_BYTES {
             return Err("request exceeds 8 MiB message limit".into());
         }
-        let mut output = OwnedDotnetString::new(&self.api);
-        let status = (self.api.invoke)(self.handle, RustString::new(bytes)?, &mut output.value);
-        let bytes = output.into_bytes()?;
-        if status != 0 {
-            return Err(format!(
-                "managed ABI invocation ({status}): {}",
-                String::from_utf8_lossy(&bytes)
-            ));
-        }
-        Ok(bytes)
+        (self.api.invoke)(RustString::new(bytes)?).into_bytes(&self.api, "invocation")
     }
 }
 impl Drop for ManagedHost {
     fn drop(&mut self) {
-        let mut output = OwnedDotnetString::new(&self.api);
-        let status = (self.api.destroy)(self.handle, &mut output.value);
-        if status != 0 {
-            eprintln!(
-                "ShojiWM .NET host disposal ({status}): {:?}",
-                output
-                    .into_bytes()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-            );
+        if let Err(error) = (self.api.shutdown)().into_bytes(&self.api, "shutdown") {
+            eprintln!("ShojiWM .NET {error}");
         }
     }
 }
@@ -277,7 +343,7 @@ impl InProcessDotNetHost {
             .name("dotnet-runtime".into())
             .spawn(move || {
                 let result =
-                    bootstrap(&component).and_then(|api| ManagedHost::create(api, &config));
+                    bootstrap(&component).and_then(|api| ManagedHost::initialize(api, &config));
                 let host = match result {
                     Ok(host) => host,
                     Err(error) => {
@@ -343,6 +409,16 @@ mod tests {
         };
         assert_eq!(std::mem::size_of::<RustString>(), size);
         assert_eq!(std::mem::size_of::<DotnetString>(), size);
+        assert_eq!(std::mem::size_of::<NativeStatus>(), 4);
+        assert_eq!(
+            std::mem::size_of::<NativeResult>(),
+            if size == 16 { 24 } else { 12 }
+        );
+        assert_eq!(std::mem::offset_of!(NativeResult, status), 0);
+        assert_eq!(
+            std::mem::offset_of!(NativeResult, response),
+            std::mem::size_of::<usize>()
+        );
         assert_eq!(std::mem::offset_of!(RustString, ptr), 0);
         assert_eq!(std::mem::offset_of!(DotnetString, ptr), 0);
         assert_eq!(
@@ -374,19 +450,22 @@ mod tests {
                 }
             }
         }
-        extern "system" fn create(_: RustString, _: *mut usize, _: *mut DotnetString) -> i32 {
-            0
+        extern "system" fn initialize(_: RustString) -> NativeResult {
+            NativeResult {
+                status: NativeStatus::Success as i32,
+                response: DotnetString::empty(),
+            }
         }
-        extern "system" fn invoke(_: usize, _: RustString, _: *mut DotnetString) -> i32 {
-            0
+        extern "system" fn invoke(_: RustString) -> NativeResult {
+            initialize(RustString::new(&[]).unwrap())
         }
-        extern "system" fn destroy(_: usize, _: *mut DotnetString) -> i32 {
-            0
+        extern "system" fn shutdown() -> NativeResult {
+            initialize(RustString::new(&[]).unwrap())
         }
         let api = Bootstrap {
-            create,
+            initialize,
             invoke,
-            destroy,
+            shutdown,
             free,
         };
         let cases = [
@@ -413,6 +492,24 @@ mod tests {
         }
         drop(OwnedDotnetString::new(&api));
         assert_eq!(FREED.load(Ordering::SeqCst), cases.len() + 1);
+        for (offset, status) in [
+            NativeStatus::Failure as i32,
+            NativeStatus::AllocationFailure as i32,
+            999,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = NativeResult {
+                status,
+                response: DotnetString {
+                    ptr: Box::into_raw(Box::new(b'x')),
+                    length: 1,
+                },
+            };
+            assert!(result.into_bytes(&api, "test").is_err());
+            assert_eq!(FREED.load(Ordering::SeqCst), cases.len() + 2 + offset);
+        }
     }
 
     #[test]

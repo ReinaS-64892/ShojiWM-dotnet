@@ -80,6 +80,9 @@ fn main() {
     let host = Arc::new(Mutex::new(
         InProcessDotNetHost::start(&runtime.with_extension(""), &fixture).unwrap(),
     ));
+    // Reject a second owner without shutting down or replacing the active singleton.
+    let duplicate = InProcessDotNetHost::start(&runtime, &fixture).unwrap_err();
+    assert!(duplicate.contains("already initialized"), "{duplicate}");
     assert!(request(&host, "lifecycleEnable", 1, None, None)["ok"] == true);
     let first = request(&host, "evaluate", 2, None, None);
     assert_eq!(first["serialized"]["children"][0]["props"]["text"], text);
