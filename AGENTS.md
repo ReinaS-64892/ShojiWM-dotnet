@@ -1,6 +1,7 @@
 # 作業規則
 
 - 作業報告とドキュメントは、原則として簡潔な日本語で書く。
+- `README.md` に利用・実装メモを追記しない。今後の補足説明は `AI-UsageNote.md` に追記する。
 - 既存の未コミット変更は、依頼された範囲を除いて変更・破棄・コミットしない。
 - `ShojiWM/` は upstream submodule として扱い、ソースや submodule の参照コミットを変更しない。
 - `old-integrated/ShojiWM/` は旧実装の参照専用。旧 compositor patch を再導入しない。

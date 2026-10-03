@@ -2,8 +2,8 @@
 use shojiwm_dotnet::DotNetLauncher;
 use shojiwm_lib::{
     runtime_api::{
-        DecorationRequest, HostMessage, LaunchContext, RuntimeEvent, RuntimeHost, RuntimeLauncher,
-        RuntimeReply, RuntimeRequest,
+        ConfigRuntime, DecorationRequest, HostMessage, LaunchContext, ReloadPreparation,
+        RuntimeEvent, RuntimeHost, RuntimeLauncher, RuntimeReply, RuntimeRequest,
     },
     ssd::{
         DecorationNode, DecorationNodeKind, WaylandWindowAction, WaylandWindowSnapshot,
@@ -15,6 +15,31 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+
+fn await_preparation(host: &RuntimeHost) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    loop {
+        while let Some(message) = host.pop() {
+            if let HostMessage::ReloadReady(result) = message {
+                return result;
+            }
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(125),
+            "reload timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn reload(runtime: &mut dyn ConfigRuntime, host: &RuntimeHost) -> Result<(), String> {
+    assert!(matches!(
+        runtime.prepare_reload().map_err(|e| e.to_string())?,
+        ReloadPreparation::Pending
+    ));
+    await_preparation(host)?;
+    runtime.reload().map_err(|e| e.to_string())
+}
 
 struct Directory(PathBuf);
 impl Directory {
@@ -204,7 +229,10 @@ fn real_launcher_lifecycle_host_reload_rollback_and_shutdown() {
 
     for failure in ["constructor", "enable", "render", "tree"] {
         settings("rejected", failure);
-        assert!(runtime.reload().is_err(), "reload accepted {failure}");
+        assert!(
+            reload(runtime.as_mut(), &host).is_err(),
+            "reload accepted {failure}"
+        );
         assert!(
             host.pop().is_none(),
             "candidate config escaped before commit"
@@ -215,7 +243,7 @@ fn real_launcher_lifecycle_host_reload_rollback_and_shutdown() {
         );
     }
     settings("after", "");
-    runtime.reload().unwrap();
+    reload(runtime.as_mut(), &host).unwrap();
     assert!(matches!(host.pop(), Some(HostMessage::Debug(update)) if update.fps_counter));
     assert!(host.pop().is_none());
     let tree = evaluate(runtime.as_mut(), &window);
@@ -274,7 +302,7 @@ fn real_launcher_lifecycle_host_reload_rollback_and_shutdown() {
         )])),
     );
     settings("environment", "");
-    runtime.reload().unwrap();
+    reload(runtime.as_mut(), &host).unwrap();
     host.pop();
     assert_eq!(
         label(&evaluate(runtime.as_mut(), &window)),
@@ -324,7 +352,19 @@ fn project_build_reload_keeps_active_config_on_build_failure() {
     let directory = Directory::new();
     let project = directory.0.join("Config.csproj");
     let api = Path::new(env!("CARGO_MANIFEST_DIR")).join("dotnet/ShojiWM/ShojiWM.csproj");
-    fs::write(&project, format!(r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup><ItemGroup><ProjectReference Include="{}" /></ItemGroup></Project>"#, api.display())).unwrap();
+    let gate = directory.0.join("hold-build");
+    let pid = directory.0.join("build-pid");
+    let script = directory.0.join("gate.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nwhile test -f '{}'; do sleep 0.1; done\n",
+            pid.display(),
+            gate.display()
+        ),
+    )
+    .unwrap();
+    fs::write(&project, format!(r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup><ItemGroup><ProjectReference Include="{}" /></ItemGroup><Target Name="TestGate" BeforeTargets="CoreCompile" Condition="Exists('{}')"><Exec Command="sh '{}'" /></Target></Project>"#, api.display(), gate.display(), script.display())).unwrap();
     fs::write(
         directory.0.join("NuGet.Config"),
         "<configuration><packageSources><clear /></packageSources></configuration>",
@@ -344,12 +384,13 @@ public sealed class Config : IWindowConfig {{
     let bootstrap = PathBuf::from(std::env::var_os("SHOJI_TEST_DOTNET_RUNTIME").unwrap())
         .canonicalize()
         .unwrap();
+    let host = RuntimeHost::detached();
     let context = LaunchContext {
         config_path: Some(directory.0.join("Config.dll")),
         runtime_dir: bootstrap.parent().map(Path::to_owned),
         dev: true,
         extra: BTreeMap::from([("dotnet-project".into(), project.to_str().unwrap().into())]),
-        host: RuntimeHost::detached(),
+        host: host.clone(),
     };
     let mut runtime = DotNetLauncher.launch(context);
     runtime.preload().unwrap();
@@ -375,17 +416,77 @@ public sealed class Config : IWindowConfig {{
     };
     assert_eq!(label(&evaluate(runtime.as_mut(), &window)), Some("before"));
     fs::write(&source, "not valid C#").unwrap();
+    assert!(matches!(
+        runtime.prepare_reload().unwrap(),
+        ReloadPreparation::Pending
+    ));
+    assert_eq!(label(&evaluate(runtime.as_mut(), &window)), Some("before"));
+    assert!(
+        await_preparation(&host)
+            .unwrap_err()
+            .contains("build failed")
+    );
+    assert_eq!(label(&evaluate(runtime.as_mut(), &window)), Some("before"));
+    fs::write(&source, config_source("after")).unwrap();
+    fs::write(&gate, "hold").unwrap();
+    assert!(matches!(
+        runtime.prepare_reload().unwrap(),
+        ReloadPreparation::Pending
+    ));
+    assert!(matches!(
+        runtime.prepare_reload().unwrap(),
+        ReloadPreparation::Pending
+    ));
+    assert_eq!(label(&evaluate(runtime.as_mut(), &window)), Some("before"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !pid.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(
         runtime
             .reload()
             .unwrap_err()
             .to_string()
-            .contains("build failed")
+            .contains("still running")
     );
     assert_eq!(label(&evaluate(runtime.as_mut(), &window)), Some("before"));
-    fs::write(&source, config_source("after")).unwrap();
+    fs::remove_file(&gate).unwrap();
+    await_preparation(&host).unwrap();
+    assert_eq!(label(&evaluate(runtime.as_mut(), &window)), Some("before"));
     runtime.reload().unwrap();
+    assert!(host.pop().is_none(), "duplicate reload notification");
     assert_eq!(label(&evaluate(runtime.as_mut(), &window)), Some("after"));
+    // Cancel a real blocked compiler, including its MSBuild Exec descendant.
+    fs::remove_file(&pid).unwrap();
+    fs::write(&gate, "hold").unwrap();
+    runtime.prepare_reload().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !pid.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let child = fs::read_to_string(&pid).unwrap();
+    let start = std::time::Instant::now();
+    runtime.shutdown();
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    // Orphans can briefly be zombies until init reaps them, but must not run.
+    let path = format!("/proc/{}/stat", child.trim());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match fs::read_to_string(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Ok(stat) if stat.rsplit_once(") ").unwrap().1.starts_with('Z') => break,
+            _ => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "build descendant remained running"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+    assert!(host.pop().is_none());
     // Drop is also a shutdown boundary, even if the caller omits shutdown().
     drop(runtime);
 }

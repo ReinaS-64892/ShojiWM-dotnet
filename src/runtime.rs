@@ -1,9 +1,17 @@
-use std::{path::PathBuf, sync::atomic::AtomicBool};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+};
 
 use shojiwm_lib::{
     runtime_api::{
-        ConfigRuntime, DecorationRequest, LaunchContext, RuntimeError, RuntimeEvent,
-        RuntimeLauncher, RuntimeReply, RuntimeRequest, cli::ArgSpec,
+        ConfigRuntime, DecorationRequest, HostMessage, LaunchContext, ReloadPreparation,
+        RuntimeError, RuntimeEvent, RuntimeHost, RuntimeLauncher, RuntimeReply, RuntimeRequest,
+        cli::ArgSpec,
     },
     ssd::DecorationEvaluator,
 };
@@ -48,6 +56,7 @@ impl RuntimeLauncher for DotNetLauncher {
 pub struct DotNetRuntime {
     context: LaunchContext,
     evaluator: Option<DotNetDecorationEvaluator>,
+    preparation: Option<ReloadJob>,
     enabled: bool,
     stopped: bool,
     displays: std::collections::BTreeMap<String, shojiwm_lib::ssd::WaylandOutputSnapshot>,
@@ -64,6 +73,7 @@ impl DotNetRuntime {
         Self {
             context,
             evaluator: None,
+            preparation: None,
             enabled: false,
             stopped: false,
             displays: Default::default(),
@@ -100,34 +110,112 @@ impl DotNetRuntime {
         PathBuf::from("ShojiWM.Runtime.dll")
     }
 
-    fn stage(&self) -> Result<(std::sync::Arc<GenerationDirectory>, PathBuf), RuntimeError> {
-        let config =
-            self.context.config_path.as_ref().ok_or_else(|| {
-                error("dotnet requires --config /path/to/Config.dll or SHOJI_CONFIG")
-            })?;
-        if let Some(project) = self.context.extra.get("dotnet-project") {
-            let directory = GenerationDirectory::create().map_err(error)?;
-            source::build_project(
-                std::path::Path::new(project),
-                directory.path(),
-                &AtomicBool::new(false),
-            )
-            .map_err(error)?;
-            let assembly = directory.path().join(
-                config
-                    .file_name()
-                    .ok_or_else(|| error("config has no filename"))?,
-            );
-            if !assembly.is_file() {
-                return Err(error(format!(
-                    "build did not produce {} (match --config filename to AssemblyName)",
-                    assembly.display()
-                )));
-            }
-            Ok((directory, assembly))
-        } else {
-            GenerationDirectory::copy_config(config).map_err(error)
+    fn stage(&self) -> Result<StagedConfig, RuntimeError> {
+        stage_config(
+            self.config_path()?,
+            self.project().as_deref(),
+            &AtomicBool::new(false),
+        )
+        .map_err(error)
+    }
+
+    fn config_path(&self) -> Result<&Path, RuntimeError> {
+        self.context
+            .config_path
+            .as_deref()
+            .ok_or_else(|| error("dotnet requires --config /path/to/Config.dll or SHOJI_CONFIG"))
+    }
+
+    fn project(&self) -> Option<PathBuf> {
+        self.context.extra.get("dotnet-project").map(PathBuf::from)
+    }
+
+    fn load_initial(&mut self, (directory, assembly): StagedConfig) -> Result<(), RuntimeError> {
+        let evaluator =
+            DotNetDecorationEvaluator::for_generation(self.component(), assembly, directory)
+                .with_host(self.context.host.clone());
+        evaluator.preload()?;
+        evaluator.set_display_state(self.displays.clone());
+        evaluator.set_input_state(self.inputs.clone());
+        self.evaluator = Some(evaluator);
+        Ok(())
+    }
+}
+
+type StagedConfig = (Arc<GenerationDirectory>, PathBuf);
+
+fn stage_config(
+    config: &Path,
+    project: Option<&Path>,
+    stop: &AtomicBool,
+) -> Result<StagedConfig, String> {
+    if let Some(project) = project {
+        let directory = GenerationDirectory::create()?;
+        source::build_project(project, directory.path(), stop)?;
+        let assembly = directory
+            .path()
+            .join(config.file_name().ok_or("config has no filename")?);
+        if !assembly.is_file() {
+            return Err(format!(
+                "build did not produce {} (match --config filename to AssemblyName)",
+                assembly.display()
+            ));
         }
+        Ok((directory, assembly))
+    } else {
+        GenerationDirectory::copy_config(config)
+    }
+}
+
+/// Only owned paths/output cross this worker boundary. It never holds the
+/// evaluator lock or calls managed code, so active requests remain usable.
+struct ReloadJob {
+    stop: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<Result<StagedConfig, String>>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ReloadJob {
+    fn spawn(
+        host: RuntimeHost,
+        prepare: impl FnOnce(&AtomicBool) -> Result<StagedConfig, String> + Send + 'static,
+    ) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let result = Arc::new(Mutex::new(None));
+        let worker_stop = stop.clone();
+        let worker_result = result.clone();
+        let worker = thread::Builder::new()
+            .name("dotnet-reload".into())
+            .spawn(move || {
+                let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prepare(&worker_stop)
+                }))
+                .unwrap_or_else(|_| Err(".NET reload worker panicked".into()));
+                let notification = prepared.as_ref().map(|_| ()).map_err(Clone::clone);
+                // Store before notifying, under the same lock, so a retry cannot
+                // overtake an old failure notification.
+                let mut result = worker_result.lock().unwrap();
+                if !worker_stop.load(Ordering::Acquire) {
+                    *result = Some(prepared);
+                    host.send(HostMessage::ReloadReady(notification));
+                }
+            })
+            .map_err(|e| format!("could not start reload worker: {e}"))?;
+        Ok(Self {
+            stop,
+            result,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for ReloadJob {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        // Result drops here, releasing unpublished staging directories.
     }
 }
 
@@ -137,15 +225,7 @@ impl ConfigRuntime for DotNetRuntime {
         if self.evaluator.is_some() {
             return Ok(());
         }
-        let (directory, assembly) = self.stage()?;
-        let evaluator =
-            DotNetDecorationEvaluator::for_generation(self.component(), assembly, directory)
-                .with_host(self.context.host.clone());
-        evaluator.preload()?;
-        evaluator.set_display_state(self.displays.clone());
-        evaluator.set_input_state(self.inputs.clone());
-        self.evaluator = Some(evaluator);
-        Ok(())
+        self.load_initial(self.stage()?)
     }
 
     fn enable(&mut self) -> Result<(), RuntimeError> {
@@ -156,15 +236,52 @@ impl ConfigRuntime for DotNetRuntime {
         self.ensure_running()
     }
 
+    fn prepare_reload(&mut self) -> Result<ReloadPreparation, RuntimeError> {
+        self.ensure_running()?;
+        if let Some(job) = &self.preparation {
+            // Coalesce repeated reload keys. A failed build has already notified
+            // upstream (which does not call reload on failure), so allow retry.
+            if !job
+                .result
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(Result::is_err)
+            {
+                return Ok(ReloadPreparation::Pending);
+            }
+        }
+        self.preparation.take();
+        let config = self.config_path()?.to_owned();
+        let project = self.project();
+        self.preparation = Some(
+            ReloadJob::spawn(self.context.host.clone(), move |stop| {
+                stage_config(&config, project.as_deref(), stop)
+            })
+            .map_err(error)?,
+        );
+        Ok(ReloadPreparation::Pending)
+    }
+
     fn reload(&mut self) -> Result<(), RuntimeError> {
         self.ensure_running()?;
-        // Recovery after an initial load failure is supported without restarting
-        // the compositor. Normal reload always retains its permanent host thread.
+        let job = self
+            .preparation
+            .as_ref()
+            .ok_or_else(|| error("reload requires prepare_reload first"))?;
+        let prepared = job
+            .result
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| error(".NET reload preparation is still running"))?;
+        self.preparation.take();
+        let (directory, assembly) = prepared.map_err(error)?;
+        // Recovery uses the prepared output too; never compile again at commit.
         if self.evaluator.is_none() {
-            self.preload()?;
+            self.load_initial((directory, assembly))?;
             return self.enable();
         }
-        let (directory, assembly) = self.stage()?;
         let current = self.evaluator()?;
         if !current.has_active_host() {
             return Err(error(".NET host is unavailable; restart required"));
@@ -253,6 +370,7 @@ impl ConfigRuntime for DotNetRuntime {
             return;
         }
         self.stopped = true;
+        self.preparation.take();
         if let Some(evaluator) = self.evaluator.take() {
             evaluator.retire("shutdown");
         }
@@ -281,6 +399,83 @@ mod tests {
             extra: Default::default(),
             host: RuntimeHost::detached(),
         }
+    }
+
+    #[test]
+    fn preparation_is_nonblocking_coalesced_and_commits_only_when_ready() {
+        let host = RuntimeHost::detached();
+        let mut ctx = context();
+        ctx.host = host.clone();
+        let mut runtime = DotNetRuntime::new(ctx);
+        let (release, wait) = std::sync::mpsc::channel();
+        runtime.preparation = Some(
+            ReloadJob::spawn(host.clone(), move |_| {
+                wait.recv().unwrap();
+                Err("test failure".into())
+            })
+            .unwrap(),
+        );
+        assert!(matches!(
+            runtime.prepare_reload().unwrap(),
+            ReloadPreparation::Pending
+        ));
+        assert!(
+            runtime
+                .reload()
+                .unwrap_err()
+                .to_string()
+                .contains("still running")
+        );
+        assert!(matches!(
+            runtime.request(0.0, RuntimeRequest::SchedulerTick).unwrap(),
+            RuntimeReply::Unhandled
+        ));
+        assert!(host.pop().is_none());
+        release.send(()).unwrap();
+        runtime
+            .preparation
+            .as_mut()
+            .unwrap()
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            matches!(host.pop(), Some(HostMessage::ReloadReady(Err(message))) if message == "test failure")
+        );
+        assert!(
+            runtime
+                .reload()
+                .unwrap_err()
+                .to_string()
+                .contains("test failure")
+        );
+        assert!(runtime.preparation.is_none());
+        assert!(host.pop().is_none());
+    }
+
+    #[test]
+    fn shutdown_cancels_and_joins_preparation_without_publishing() {
+        let host = RuntimeHost::detached();
+        let mut runtime = DotNetRuntime::new(context());
+        let (started, wait) = std::sync::mpsc::channel();
+        runtime.preparation = Some(
+            ReloadJob::spawn(host.clone(), move |stop| {
+                let directory = GenerationDirectory::create()?;
+                started.send(directory.path().to_owned()).unwrap();
+                while !stop.load(Ordering::Acquire) {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok((directory, "unused.dll".into()))
+            })
+            .unwrap(),
+        );
+        let path = wait.recv().unwrap();
+        runtime.shutdown();
+        assert!(!path.exists());
+        assert!(host.pop().is_none());
+        assert!(runtime.prepare_reload().is_err());
     }
 
     #[test]
