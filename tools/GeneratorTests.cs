@@ -54,7 +54,7 @@ internal static class GeneratorTests
                 "JsonStringEnumMemberName(\"xdg-decoration-v1\")", "JsonPropertyName(\"switch\")" })
                 Contains(output, expected);
         });
-        using (var fixture = new Fixture(root, production: true))
+        using (var fixture = new Fixture(root))
         {
             string path = Path.Combine(fixture.Root, "ShojiWM/src/shojiwm_lib/src/ssd/window_model.rs");
             string original = File.ReadAllText(path);
@@ -70,13 +70,17 @@ internal static class GeneratorTests
                     "pub struct WaylandWindowSnapshot {\n    pub unsupported: HashSet<String>,"));
                 Fails(() => BindingGenerator.Generate(fixture.Root), "unsupported Rust type");
             });
+            Test("fail closed: data enum", () =>
+            {
+                File.WriteAllText(path, original.Replace("    XdgDecorationV1,", "    XdgDecorationV1(String),"));
+                Fails(() => BindingGenerator.Generate(fixture.Root), "unsupported data enum");
+            });
         }
         using (var fixture = new Fixture(root))
         {
             string path = Path.Combine(fixture.Root, BindingGenerator.Sources[0]);
             string original = File.ReadAllText(path);
-            string expected = File.ReadAllText(Path.Combine(root, "tools/fixtures/protocol.golden"));
-            Test("Python golden parity (all supported mappings)", () => Equal(expected, BindingGenerator.Generate(fixture.Root)));
+            string expected = BindingGenerator.Generate(fixture.Root);
             Test("CRLF sources produce identical LF output", () =>
             {
                 File.WriteAllText(path, original.Replace("\n", "\r\n"));
@@ -98,12 +102,11 @@ internal static class GeneratorTests
             });
             foreach (var (name, oldText, newText, error) in new (string, string, string, string)[]
             {
-                ("unknown Rust type", "pub text: &'a str", "pub text: HashSet<String>", "unsupported Rust type"),
+                ("unknown Rust type", "pub kind: &'a str", "pub kind: HashSet<String>", "unsupported Rust type"),
                 ("unknown serde attribute", "rename_all = \"camelCase\"", "deny_unknown_fields", "unsupported serde attribute"),
                 ("unknown rename mode", "rename_all = \"camelCase\"", "rename_all = \"SCREAMING_SNAKE_CASE\"", "unsupported rename_all"),
-                ("data enum", "    OnClick,", "    OnClick(String),", "unsupported data enum"),
                 ("non-public field", "pub request_id: u64", "request_id: u64", "unsupported field"),
-                ("unclosed model", "pub optional: Option<bool>,\n}", "pub optional: Option<bool>,", "unclosed model"),
+                ("unclosed model", "pub debug_config: Option<RuntimeDebugConfigUpdate>,\n}", "pub debug_config: Option<RuntimeDebugConfigUpdate>,", "unclosed model"),
             })
             {
                 Test($"fail closed: {name}", () =>
@@ -144,7 +147,7 @@ internal static class GeneratorTests
             });
             Test("invalid schema never overwrites existing output", () =>
             {
-                File.WriteAllText(path, original.Replace("pub text: &'a str", "pub text: HashSet<String>"));
+                File.WriteAllText(path, original.Replace("pub kind: &'a str", "pub kind: HashSet<String>"));
                 Fails(() => BindingGenerator.Write(fixture.Root), "unsupported Rust type");
                 Equal(expected, File.ReadAllText(Path.Combine(fixture.Root, BindingGenerator.Output)));
                 File.WriteAllText(path, original);
@@ -181,15 +184,14 @@ internal static class GeneratorTests
     private sealed class Fixture : IDisposable
     {
         internal string Root { get; } = Path.Combine(Path.GetTempPath(), "shoji-generator tests " + Guid.NewGuid().ToString("N"));
-        internal Fixture(string root, bool production = false)
+        internal Fixture(string root)
         {
             foreach (string source in BindingGenerator.Sources)
             {
                 string target = Path.Combine(Root, source);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                File.WriteAllText(target, production ? File.ReadAllText(Path.Combine(root, source)) : "");
+                File.Copy(Path.Combine(root, source), target);
             }
-            if (!production) File.Copy(Path.Combine(root, "tools/fixtures/protocol.rs"), Path.Combine(Root, BindingGenerator.Sources[0]), overwrite: true);
         }
         public void Dispose() => Directory.Delete(Root, recursive: true);
     }

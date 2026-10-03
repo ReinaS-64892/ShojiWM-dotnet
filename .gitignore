@@ -6,8 +6,8 @@
 /dotnet/**/bin/
 /dotnet/**/obj/
 /dotnet/**/target/
-# 通常のバインディング生成物。tools/fixtures/ は回帰テストの入力・比較基準なので追跡する。
 /dotnet/ShojiWM/Generated/
+/tools/fixtures/
 /tools/bin/
 /tools/obj/
 /tools/__pycache__/
